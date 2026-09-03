@@ -203,6 +203,17 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
 
   ValkeyModule_ReplyWithArray(ctx, elements_per_result * range.count() + 1);
   ReplyAvailNeighbors(ctx, search_result, command);
+
+  const bool is_numeric = [&]() -> bool {
+    if (!command.with_sort_keys || !command.sortby_parameter.has_value()) {
+      return false;
+    }
+    auto idx = command.index_schema->GetIndex(command.sortby_parameter->field);
+    return idx.ok() &&
+           idx.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
+  }();
+  const std::string prefix_str = is_numeric ? "#" : "$";
+
   for (size_t i = range.start_index; i < range.end_index; ++i) {
     // Document ID
     ValkeyModule_ReplyWithString(
@@ -213,12 +224,13 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
       ReplyScoreTopLevel(ctx, neighbors[i].score);
     }
 
-    // Sort key value (prefixed with #) when WITHSORTKEYS is specified
+    // Prefix the sort key: '#' for NUMERIC fields, '$' for string fields
+    // (RediSearch-compatible).
     if (command.with_sort_keys) {
       std::string sort_key_value = GetSortKeyValue(neighbors[i], command);
-      std::string prefixed_value = "#" + sort_key_value;
+      std::string value_with_prefix = prefix_str + sort_key_value;
       ValkeyModule_ReplyWithString(
-          ctx, vmsdk::MakeUniqueValkeyString(prefixed_value).get());
+          ctx, vmsdk::MakeUniqueValkeyString(value_with_prefix).get());
     }
 
     const auto &contents = neighbors[i].attribute_contents.value();

@@ -1041,6 +1041,47 @@ class TestNonVector(ValkeySearchTestCaseBase):
         create_bulk_data_standalone(client)
         validate_tag_and_negate_queries(client)
 
+    def test_withsortkeys_prefix_by_field_type(self):
+        """
+            Regression test for issue #1353, divergence item 4.
+
+            Previously WITHSORTKEYS prefixed every sort key with '#'. To match
+            RediSearch, NUMERIC sort keys use '#' but string (TEXT) sort keys must
+            use '$' (the divergence case). This test asserts the
+            prefix now follows the SORTBY field type for both.
+        """
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "sortkey_prefix_idx", "ON", "HASH", "PREFIX", "1", "skp:",
+            "SCHEMA", "m", "TAG", "z", "TEXT", "SORTABLE", "n", "NUMERIC") == b"OK"
+        # Lower-case-only values keep this test independent of the
+        # case-collation divergence (issue #1353, divergence 3), and distinct
+        # values avoid the tie-order divergence (divergence 8).
+        assert client.execute_command("HSET", "skp:1", "m", "all", "z", "zebra", "n", "3") == 3
+        assert client.execute_command("HSET", "skp:2", "m", "all", "z", "apple", "n", "1") == 3
+        assert client.execute_command("HSET", "skp:3", "m", "all", "z", "mango", "n", "2") == 3
+
+        result = client.execute_command(
+            "FT.SEARCH", "sortkey_prefix_idx", "@m:{all}", "SORTBY", "z", "ASC",
+            "WITHSORTKEYS", "RETURN", "1", "z", "DIALECT", "2")
+        assert result == [
+            3,
+            b"skp:2", b"$apple", [b"z", b"apple"],
+            b"skp:3", b"$mango", [b"z", b"mango"],
+            b"skp:1", b"$zebra", [b"z", b"zebra"],
+        ]
+
+        # Integer values avoid the numeric-normalization divergence (divergence 6).
+        result = client.execute_command(
+            "FT.SEARCH", "sortkey_prefix_idx", "@m:{all}", "SORTBY", "n", "ASC",
+            "WITHSORTKEYS", "RETURN", "1", "n", "DIALECT", "2")
+        assert result == [
+            3,
+            b"skp:2", b"#1", [b"n", b"1"],
+            b"skp:3", b"#2", [b"n", b"2"],
+            b"skp:1", b"#3", [b"n", b"3"],
+        ]
+
 class TestAggregateReducerAlias(ValkeySearchTestCaseDebugMode):
     """
         A REDUCE with no AS clause auto-generates its output name, and which form
