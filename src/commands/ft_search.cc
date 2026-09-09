@@ -17,11 +17,13 @@
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "src/commands/commands.h"
 #include "src/commands/ft_search_parser.h"
 #include "src/indexes/index_base.h"
+#include "src/indexes/tag.h"
 #include "src/indexes/vector_base.h"
 #include "src/metrics.h"
 #include "src/query/response_generator.h"
@@ -260,6 +262,30 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
 }
 
 }  // namespace
+
+// Case-insensitive three-way string comparison for SORTBY collation.
+// RediSearch normalizes string sort keys to lower case at ingestion, so its
+// string SORTBY orders case-insensitively; valkey-search compares the raw
+// attribute bytes at query time, so it must fold case here to match. ASCII
+// folding only, consistent with the byte-wise expr::Compare it replaces.
+static expr::Ordering CompareStringsFoldCase(absl::string_view l,
+                                             absl::string_view r) {
+  const size_t common = std::min(l.size(), r.size());
+  for (size_t i = 0; i < common; ++i) {
+    const unsigned char cl =
+        absl::ascii_tolower(static_cast<unsigned char>(l[i]));
+    const unsigned char cr =
+        absl::ascii_tolower(static_cast<unsigned char>(r[i]));
+    if (cl != cr) {
+      return cl < cr ? expr::Ordering::kLESS : expr::Ordering::kGREATER;
+    }
+  }
+  if (l.size() == r.size()) {
+    return expr::Ordering::kEQUAL;
+  }
+  return l.size() < r.size() ? expr::Ordering::kLESS : expr::Ordering::kGREATER;
+}
+
 // Apply sorting to neighbors based on attribute values in attribute_contents
 void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
                   const SearchCommand &parameters) {
@@ -282,6 +308,17 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
   bool is_numeric =
       index_result.ok() &&
       index_result.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
+
+  // String sort keys collate case-insensitively (issue #1353, divergence 3),
+  // except for a CASESENSITIVE TAG field, which sorts by raw bytes.
+  bool fold_case = !is_numeric;
+  if (index_result.ok() &&
+      index_result.value()->GetIndexerType() == indexes::IndexerType::kTag) {
+    auto tag_index = dynamic_cast<indexes::Tag *>(index_result.value().get());
+    if (tag_index != nullptr && tag_index->IsCaseSensitive()) {
+      fold_case = false;
+    }
+  }
   auto compare = [&](const indexes::Neighbor &a,
                      const indexes::Neighbor &b) -> bool {
     if (is_vector_score) {
@@ -311,18 +348,16 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
     auto str_a = vmsdk::ToStringView(it_a->second.value.get());
     auto str_b = vmsdk::ToStringView(it_b->second.value.get());
 
-    expr::Value val_a, val_b;
+    expr::Ordering cmp;
     if (is_numeric) {
       auto num_a = vmsdk::To<double>(str_a).value_or(0.0);
       auto num_b = vmsdk::To<double>(str_b).value_or(0.0);
-      val_a = expr::Value(num_a);
-      val_b = expr::Value(num_b);
+      cmp = expr::Compare(expr::Value(num_a), expr::Value(num_b));
+    } else if (fold_case) {
+      cmp = CompareStringsFoldCase(str_a, str_b);
     } else {
-      val_a = expr::Value(str_a);
-      val_b = expr::Value(str_b);
+      cmp = expr::Compare(expr::Value(str_a), expr::Value(str_b));
     }
-
-    auto cmp = expr::Compare(val_a, val_b);
     if (cmp == expr::Ordering::kLESS) {
       return sortby.order == query::SortOrder::kAscending;
     }

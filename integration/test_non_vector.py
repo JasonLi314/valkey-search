@@ -1082,6 +1082,96 @@ class TestNonVector(ValkeySearchTestCaseBase):
             b"skp:1", b"#3", [b"n", b"3"],
         ]
 
+    def test_string_sortby_collates_case_insensitively(self):
+        """
+            Regression test for issue #1353, divergence item 3.
+
+            Previously string SORTBY compared the raw attribute bytes, so every
+            upper-case value sorted before every lower-case one (Banana, Cherry,
+            apple, date). RediSearch normalizes string sort keys to lower case,
+            so string SORTBY collates case-insensitively (apple, Banana, Cherry,
+            date) for TEXT and TAG fields alike. A CASESENSITIVE TAG field is
+            the exception: its sort keys keep raw-byte order. Expected replies
+            verified against RediSearch 2.10.20 (search 21020).
+
+            Folded-distinct values throughout keep this test independent of the
+            tie-order divergence (divergence 8), and no WITHSORTKEYS since the
+            emitted sort-key bytes are not normalized to lower case here.
+        """
+        client: Valkey = self.server.get_new_client()
+
+        # TEXT SORTABLE, mixed case, loaded in neither byte nor folded order.
+        assert client.execute_command(
+            "FT.CREATE", "case_collation_idx", "ON", "HASH", "PREFIX", "1", "cc:",
+            "SCHEMA", "m", "TAG", "s", "TEXT", "SORTABLE") == b"OK"
+        assert client.execute_command("HSET", "cc:1", "m", "all", "s", "Banana") == 2
+        assert client.execute_command("HSET", "cc:2", "m", "all", "s", "apple") == 2
+        assert client.execute_command("HSET", "cc:3", "m", "all", "s", "Cherry") == 2
+        assert client.execute_command("HSET", "cc:4", "m", "all", "s", "date") == 2
+
+        result = client.execute_command(
+            "FT.SEARCH", "case_collation_idx", "@m:{all}", "SORTBY", "s", "ASC",
+            "RETURN", "1", "s", "DIALECT", "2")
+        assert result == [
+            4,
+            b"cc:2", [b"s", b"apple"],
+            b"cc:1", [b"s", b"Banana"],
+            b"cc:3", [b"s", b"Cherry"],
+            b"cc:4", [b"s", b"date"],
+        ]
+
+        result = client.execute_command(
+            "FT.SEARCH", "case_collation_idx", "@m:{all}", "SORTBY", "s", "DESC",
+            "RETURN", "1", "s", "DIALECT", "2")
+        assert result == [
+            4,
+            b"cc:4", [b"s", b"date"],
+            b"cc:3", [b"s", b"Cherry"],
+            b"cc:1", [b"s", b"Banana"],
+            b"cc:2", [b"s", b"apple"],
+        ]
+
+        # TAG SORTABLE (default, case-insensitive) collates the same way.
+        assert client.execute_command(
+            "FT.CREATE", "case_collation_tag_idx", "ON", "HASH", "PREFIX", "1",
+            "cct:", "SCHEMA", "m", "TAG", "g", "TAG", "SORTABLE") == b"OK"
+        assert client.execute_command("HSET", "cct:1", "m", "all", "g", "Beta") == 2
+        assert client.execute_command("HSET", "cct:2", "m", "all", "g", "alpha") == 2
+        assert client.execute_command("HSET", "cct:3", "m", "all", "g", "Gamma") == 2
+        assert client.execute_command("HSET", "cct:4", "m", "all", "g", "delta") == 2
+
+        result = client.execute_command(
+            "FT.SEARCH", "case_collation_tag_idx", "@m:{all}", "SORTBY", "g",
+            "ASC", "RETURN", "1", "g", "DIALECT", "2")
+        assert result == [
+            4,
+            b"cct:2", [b"g", b"alpha"],
+            b"cct:1", [b"g", b"Beta"],
+            b"cct:4", [b"g", b"delta"],
+            b"cct:3", [b"g", b"Gamma"],
+        ]
+
+        # A CASESENSITIVE TAG keeps raw-byte order: upper case sorts first.
+        assert client.execute_command(
+            "FT.CREATE", "case_collation_cs_idx", "ON", "HASH", "PREFIX", "1",
+            "ccs:", "SCHEMA", "m", "TAG",
+            "k", "TAG", "CASESENSITIVE", "SORTABLE") == b"OK"
+        assert client.execute_command("HSET", "ccs:1", "m", "all", "k", "Beta") == 2
+        assert client.execute_command("HSET", "ccs:2", "m", "all", "k", "alpha") == 2
+        assert client.execute_command("HSET", "ccs:3", "m", "all", "k", "Gamma") == 2
+        assert client.execute_command("HSET", "ccs:4", "m", "all", "k", "delta") == 2
+
+        result = client.execute_command(
+            "FT.SEARCH", "case_collation_cs_idx", "@m:{all}", "SORTBY", "k",
+            "ASC", "RETURN", "1", "k", "DIALECT", "2")
+        assert result == [
+            4,
+            b"ccs:1", [b"k", b"Beta"],
+            b"ccs:3", [b"k", b"Gamma"],
+            b"ccs:2", [b"k", b"alpha"],
+            b"ccs:4", [b"k", b"delta"],
+        ]
+
 class TestAggregateReducerAlias(ValkeySearchTestCaseDebugMode):
     """
         A REDUCE with no AS clause auto-generates its output name, and which form
