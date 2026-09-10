@@ -17,6 +17,7 @@
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "src/commands/commands.h"
@@ -93,6 +94,52 @@ void ReplyScoreTopLevel(ValkeyModuleCtx *ctx, float score) {
   auto score_value = absl::StrFormat("%.12g", score);
   ValkeyModule_ReplyWithString(
       ctx, vmsdk::MakeUniqueValkeyString(score_value).get());
+}
+
+// True when `attribute_alias` names a NUMERIC schema attribute. The schema is
+// the sole type authority: hash values are schemaless bytes, so reply-time
+// normalization keys off the declared field type (and never off SORTABLE,
+// which RediSearch does not require for normalization).
+bool IsNumericAttribute(const IndexSchema &index_schema,
+                        absl::string_view attribute_alias) {
+  auto index = index_schema.GetIndex(attribute_alias);
+  return index.ok() &&
+         index.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
+}
+
+// Formats a NUMERIC sort key the way RediSearch does (issue #1353, item 6):
+// 17 significant digits, enough for the text to round-trip the exact double.
+// Note this is a different format from RETURN values, which use
+// NormalizeNumericReturnValue below.
+std::string NormalizeNumericSortKey(absl::string_view raw) {
+  double value;
+  if (!absl::SimpleAtod(raw, &value)) {
+    // Defensive: indexed numerics were parsed at ingest, so raw always
+    // parses today. Pass unparseable bytes through unchanged.
+    return std::string(raw);
+  }
+  return absl::StrFormat("%.17g", value);
+}
+
+// Formats a NUMERIC RETURN value the way RediSearch does (issue #1353,
+// item 6): integral values render as integers, everything else at 12
+// significant digits. The range guard keeps the double->long long cast
+// defined: -2^63 is exactly representable as a double so >= is safe, while
+// +2^63 must be excluded (<, not <=) because 2^63 - 1 is not representable
+// and the nearest double IS 2^63, which would overflow the cast. Out-of-range
+// values (e.g. 1e20) take the %.12g path, matching RediSearch.
+std::string NormalizeNumericReturnValue(absl::string_view raw) {
+  double value;
+  if (!absl::SimpleAtod(raw, &value)) {
+    return std::string(raw);
+  }
+  if (value >= -9223372036854775808.0 && value < 9223372036854775808.0) {
+    const long long integral = static_cast<long long>(value);
+    if (static_cast<double>(integral) == value) {
+      return absl::StrFormat("%d", integral);
+    }
+  }
+  return absl::StrFormat("%.12g", value);
 }
 
 std::optional<std::string> GetSortKeyValue(const indexes::Neighbor &neighbor,
@@ -205,6 +252,27 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
     ++elements_per_result;
   }
 
+  // Field types are resolved once, outside the row loop: GetIndex is an
+  // opaque hash lookup the compiler cannot hoist. Numeric values are
+  // re-formatted at reply time to match RediSearch, which serializes NUMERIC
+  // fields from the parsed double rather than echoing the stored hash bytes
+  // (issue #1353, item 6).
+  const bool sort_by_is_numeric =
+      command.with_sort_keys && command.sortby_parameter.has_value() &&
+      IsNumericAttribute(*command.index_schema,
+                         command.sortby_parameter->field);
+  // attribute_alias is only set when the RETURN name resolved to a schema
+  // attribute; non-schema fields have no declared type and stay raw.
+  std::vector<bool> return_attribute_is_numeric;
+  return_attribute_is_numeric.reserve(command.return_attributes.size());
+  for (const auto &return_attribute : command.return_attributes) {
+    return_attribute_is_numeric.push_back(
+        return_attribute.attribute_alias.get() != nullptr &&
+        IsNumericAttribute(
+            *command.index_schema,
+            vmsdk::ToStringView(return_attribute.attribute_alias.get())));
+  }
+
   ValkeyModule_ReplyWithArray(ctx, elements_per_result * range.count() + 1);
   ReplyAvailNeighbors(ctx, search_result, command);
   for (size_t i = range.start_index; i < range.end_index; ++i) {
@@ -224,7 +292,9 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
       std::optional<std::string> sort_key_value =
           GetSortKeyValue(neighbors[i], command);
       if (sort_key_value.has_value()) {
-        std::string prefixed_value = "#" + *sort_key_value;
+        std::string prefixed_value =
+            "#" + (sort_by_is_numeric ? NormalizeNumericSortKey(*sort_key_value)
+                                      : *sort_key_value);
         ValkeyModule_ReplyWithString(
             ctx, vmsdk::MakeUniqueValkeyString(prefixed_value).get());
       } else {
@@ -244,12 +314,20 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
     } else {
       ValkeyModule_ReplyWithArray(ctx, VALKEYMODULE_POSTPONED_LEN);
       size_t cnt = 0;
-      for (const auto &return_attribute : command.return_attributes) {
+      for (size_t j = 0; j < command.return_attributes.size(); ++j) {
+        const auto &return_attribute = command.return_attributes[j];
         auto it = contents.find(
             vmsdk::ToStringView(return_attribute.identifier.get()));
         if (it != contents.end()) {
           ValkeyModule_ReplyWithString(ctx, return_attribute.alias.get());
-          ValkeyModule_ReplyWithString(ctx, it->second.value.get());
+          if (return_attribute_is_numeric[j]) {
+            std::string normalized = NormalizeNumericReturnValue(
+                vmsdk::ToStringView(it->second.value.get()));
+            ValkeyModule_ReplyWithString(
+                ctx, vmsdk::MakeUniqueValkeyString(normalized).get());
+          } else {
+            ValkeyModule_ReplyWithString(ctx, it->second.value.get());
+          }
           ++cnt;
         }
       }

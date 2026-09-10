@@ -1134,6 +1134,98 @@ class TestNonVector(ValkeySearchTestCaseBase):
             b"nss:3", None,   [b"m", b"all"],
         ]
 
+    def test_numeric_sortkey_and_return_normalization(self):
+        """
+            Regression test for issue #1353, item 6.
+
+            Previously WITHSORTKEYS sort keys and RETURN values echoed the raw
+            hash bytes of NUMERIC fields (e.g. '#2.500', '1e3'). RediSearch
+            serializes NUMERIC fields from the parsed double, with two
+            distinct formats: sort keys use 17 significant digits (full
+            round-trip), RETURN values render integral values as integers and
+            everything else at 12 significant digits. Expected replies are
+            byte-exact RediSearch output (search module 21020, probed
+            2026-09-10). Full-content replies (no RETURN clause) keep raw
+            bytes on both engines -- deliberately NOT normalized -- and
+            normalization does not require SORTABLE.
+
+            Fixture independence: all values are distinct as doubles (no ties,
+            item 8 invisible), every document carries the sort field (item 5
+            invisible), and there is a single RETURN clause (item 7
+            invisible).
+        """
+        client: Valkey = self.server.get_new_client()
+
+        # Values chosen to pin both formatters: -0 and 2^60 discriminate the
+        # RETURN integral path (-0 -> '0'; 2^60 renders full digits in RETURN
+        # but scientific in the sort key), the 15-digit value discriminates
+        # 12-digit RETURN rounding, 0.1/1e-7 discriminate 17-digit sort-key
+        # round-tripping, and 1e20 exercises the out-of-integer-range path.
+        # Load order coincides with neither sort order nor key order.
+        assert client.execute_command(
+            "FT.CREATE", "num_norm_idx", "ON", "HASH", "PREFIX", "1", "nn:",
+            "SCHEMA", "p", "NUMERIC", "SORTABLE") == b"OK"
+        for key, value in (("nn:1", "10"), ("nn:2", "1e20"), ("nn:3", "2.500"),
+                           ("nn:4", "-0"), ("nn:5", "3.14159265358979"),
+                           ("nn:6", "0.1"), ("nn:7", "1e3"), ("nn:8", "1e-7"),
+                           ("nn:9", "1152921504606846976")):
+            assert client.execute_command("HSET", key, "p", value) == 1
+
+        # Sort keys are normalized to 17 significant digits; RETURN values to
+        # integer-or-12-significant-digits. Both differ from the stored bytes
+        # and from each other.
+        result = client.execute_command(
+            "FT.SEARCH", "num_norm_idx", "*", "SORTBY", "p", "ASC",
+            "WITHSORTKEYS", "RETURN", "1", "p", "DIALECT", "2")
+        assert result == [
+            9,
+            b"nn:4", b"#-0",                     [b"p", b"0"],
+            b"nn:8", b"#9.9999999999999995e-08", [b"p", b"1e-07"],
+            b"nn:6", b"#0.10000000000000001",    [b"p", b"0.1"],
+            b"nn:3", b"#2.5",                    [b"p", b"2.5"],
+            b"nn:5", b"#3.14159265358979",       [b"p", b"3.14159265359"],
+            b"nn:1", b"#10",                     [b"p", b"10"],
+            b"nn:7", b"#1000",                   [b"p", b"1000"],
+            b"nn:9", b"#1.152921504606847e+18",  [b"p", b"1152921504606846976"],
+            b"nn:2", b"#1e+20",                  [b"p", b"1e+20"],
+        ]
+
+        # Scope boundary: without a RETURN clause the content is the raw
+        # document hash and must keep the stored bytes verbatim, while the
+        # sort key stays normalized. Guards against normalizing in the
+        # content-population path, which would over-normalize.
+        result = client.execute_command(
+            "FT.SEARCH", "num_norm_idx", "*", "SORTBY", "p", "ASC",
+            "WITHSORTKEYS", "DIALECT", "2")
+        assert result == [
+            9,
+            b"nn:4", b"#-0",                     [b"p", b"-0"],
+            b"nn:8", b"#9.9999999999999995e-08", [b"p", b"1e-7"],
+            b"nn:6", b"#0.10000000000000001",    [b"p", b"0.1"],
+            b"nn:3", b"#2.5",                    [b"p", b"2.500"],
+            b"nn:5", b"#3.14159265358979",       [b"p", b"3.14159265358979"],
+            b"nn:1", b"#10",                     [b"p", b"10"],
+            b"nn:7", b"#1000",                   [b"p", b"1e3"],
+            b"nn:9", b"#1.152921504606847e+18",  [b"p", b"1152921504606846976"],
+            b"nn:2", b"#1e+20",                  [b"p", b"1e20"],
+        ]
+
+        # Normalization keys off the declared NUMERIC type, not SORTABLE: a
+        # plain NUMERIC field is normalized identically.
+        assert client.execute_command(
+            "FT.CREATE", "num_norm_plain_idx", "ON", "HASH", "PREFIX", "1",
+            "nnp:", "SCHEMA", "p", "NUMERIC") == b"OK"
+        assert client.execute_command("HSET", "nnp:1", "p", "2.500") == 1
+        assert client.execute_command("HSET", "nnp:2", "p", "0.1") == 1
+        result = client.execute_command(
+            "FT.SEARCH", "num_norm_plain_idx", "*", "SORTBY", "p", "ASC",
+            "WITHSORTKEYS", "RETURN", "1", "p", "DIALECT", "2")
+        assert result == [
+            2,
+            b"nnp:2", b"#0.10000000000000001", [b"p", b"0.1"],
+            b"nnp:1", b"#2.5",                 [b"p", b"2.5"],
+        ]
+
 class TestAggregateReducerAlias(ValkeySearchTestCaseDebugMode):
     """
         A REDUCE with no AS clause auto-generates its output name, and which form
