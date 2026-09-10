@@ -1087,6 +1087,53 @@ class TestNonVector(ValkeySearchTestCaseBase):
         create_bulk_data_standalone(client)
         validate_tag_and_negate_queries(client)
 
+    def test_withsortkeys_absent_sortkey_is_nil(self):
+        """
+            Regression test for issue #1353, item 5.
+
+            Previously WITHSORTKEYS serialized an absent sort key as the bare
+            prefix string '#'. To match RediSearch, the sort-key slot must be
+            nil when there is no sort key: with WITHSORTKEYS but no SORTBY (no
+            sort key exists for any row), and for a document that lacks the
+            SORTBY field. Reply arity is unchanged -- nil occupies the slot. A
+            present-but-empty field value is a real value and keeps its
+            prefix; only ABSENT keys are nil.
+        """
+        client: Valkey = self.server.get_new_client()
+
+        # WITHSORTKEYS without SORTBY: every row's sort-key slot is nil.
+        # Single document, so ordering cannot enter the comparison.
+        assert client.execute_command(
+            "FT.CREATE", "nil_sortkey_idx", "ON", "HASH", "PREFIX", "1", "nsk:",
+            "SCHEMA", "m", "TAG", "p", "NUMERIC", "SORTABLE", "title", "TEXT") == b"OK"
+        assert client.execute_command(
+            "HSET", "nsk:1", "m", "all", "p", "10", "title", "hello world") == 3
+        result = client.execute_command(
+            "FT.SEARCH", "nil_sortkey_idx", "@m:{all}", "WITHSORTKEYS",
+            "RETURN", "1", "title", "DIALECT", "2")
+        assert result == [1, b"nsk:1", None, [b"title", b"hello world"]]
+
+        # SORTBY on a field one document lacks: that row's slot is nil and the
+        # document sorts last; rows that have the field keep the prefixed
+        # value. Integer values keep this test independent of the
+        # numeric-normalization divergence (issue #1353, item 6); distinct
+        # values avoid the tie-order divergence (item 8).
+        assert client.execute_command(
+            "FT.CREATE", "nil_sortkey_sparse_idx", "ON", "HASH", "PREFIX", "1", "nss:",
+            "SCHEMA", "m", "TAG", "p", "NUMERIC", "SORTABLE") == b"OK"
+        assert client.execute_command("HSET", "nss:1", "m", "all", "p", "20") == 2
+        assert client.execute_command("HSET", "nss:2", "m", "all", "p", "10") == 2
+        assert client.execute_command("HSET", "nss:3", "m", "all") == 1
+        result = client.execute_command(
+            "FT.SEARCH", "nil_sortkey_sparse_idx", "@m:{all}", "SORTBY", "p", "ASC",
+            "WITHSORTKEYS", "RETURN", "1", "m", "DIALECT", "2")
+        assert result == [
+            3,
+            b"nss:2", b"#10", [b"m", b"all"],
+            b"nss:1", b"#20", [b"m", b"all"],
+            b"nss:3", None,   [b"m", b"all"],
+        ]
+
 class TestAggregateReducerAlias(ValkeySearchTestCaseDebugMode):
     """
         A REDUCE with no AS clause auto-generates its output name, and which form
