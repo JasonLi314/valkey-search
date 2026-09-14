@@ -284,7 +284,8 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
 }
 
 }  // namespace
-// Apply sorting to neighbors based on attribute values in attribute_contents
+// Apply deterministic (but unstable) sorting to neighbors based on attribute
+// values in attribute_contents
 void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
                   const SearchCommand &parameters) {
   if (!parameters.sortby_parameter.has_value() || neighbors.empty()) {
@@ -306,6 +307,16 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
   bool is_numeric =
       index_result.ok() &&
       index_result.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
+  // Tied neighbors order by key, following the sort direction, so the result
+  // order is a deterministic (issue #1353 item 8). Keys are unique, so the
+  // comparator below is a total order.
+  auto tie_break = [&](const indexes::Neighbor &a,
+                       const indexes::Neighbor &b) -> bool {
+    // external id is unique in keyspace so they will never tie
+    return sortby.order == query::SortOrder::kAscending
+               ? a.external_id->Str() < b.external_id->Str()
+               : a.external_id->Str() > b.external_id->Str();
+  };
   auto compare = [&](const indexes::Neighbor &a,
                      const indexes::Neighbor &b) -> bool {
     if (is_vector_score) {
@@ -325,11 +336,15 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
     auto it_a = a.attribute_contents->find(sortby.field);
     auto it_b = b.attribute_contents->find(sortby.field);
 
-    if (it_a == a.attribute_contents->end()) {
-      return false;
-    }
-    if (it_b == b.attribute_contents->end()) {
-      return true;
+    const bool a_missing = it_a == a.attribute_contents->end();
+    const bool b_missing = it_b == b.attribute_contents->end();
+    if (a_missing || b_missing) {
+      // Documents missing the field sort last in both directions; among
+      // themselves they are ties.
+      if (a_missing && b_missing) {
+        return tie_break(a, b);
+      }
+      return b_missing;
     }
 
     auto str_a = vmsdk::ToStringView(it_a->second.value.get());
@@ -353,7 +368,8 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
     if (cmp == expr::Ordering::kGREATER) {
       return sortby.order == query::SortOrder::kDescending;
     }
-    return false;
+    // ensure deterministic sort
+    return tie_break(a, b);
   };
 
   auto amountToKeep = parameters.limit.first_index + parameters.limit.number;
