@@ -308,10 +308,11 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
       index_result.ok() &&
       index_result.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
   // Tied neighbors order by key, following the sort direction, so the result
-  // order is a deterministic (issue #1353 item 8). Keys are unique, so the
-  // comparator below is a total order.
-  auto tie_break = [&](const indexes::Neighbor &a,
-                       const indexes::Neighbor &b) -> bool {
+  // order is deterministic (solving issue #1353 item 8). Keys are unique, so
+  // the comparator below is a total order. Ensure both a and b doesn't have
+  // value before comparison, explained in caller below
+  auto tie_breaker = [&](const indexes::Neighbor &a,
+                         const indexes::Neighbor &b) -> bool {
     // external id is unique in keyspace so they will never tie
     return sortby.order == query::SortOrder::kAscending
                ? a.external_id->Str() < b.external_id->Str()
@@ -325,30 +326,35 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
                    ? a.distance < b.distance
                    : a.distance > b.distance;
       }
-      // Tie-break on key ascending for a deterministic order.
-      return a.external_id->Str() < b.external_id->Str();
-    }
-    if (!a.attribute_contents.has_value() ||
-        !b.attribute_contents.has_value()) {
-      return false;
+      return tie_breaker(a, b);
     }
 
-    auto it_a = a.attribute_contents->find(sortby.field);
-    auto it_b = b.attribute_contents->find(sortby.field);
-
-    const bool a_missing = it_a == a.attribute_contents->end();
-    const bool b_missing = it_b == b.attribute_contents->end();
-    if (a_missing || b_missing) {
-      // Documents missing the field sort last in both directions; among
-      // themselves they are ties.
-      if (a_missing && b_missing) {
-        return tie_break(a, b);
+    auto get_sortkey_val = [&](const indexes::Neighbor &neighbor)
+        -> std::optional<absl::string_view> {
+      if (!neighbor.attribute_contents) {
+        return std::nullopt;
       }
-      return b_missing;
-    }
+      auto target_field_it = neighbor.attribute_contents->find(sortby.field);
+      if (target_field_it == neighbor.attribute_contents->end()) {
+        return std::nullopt;
+      }
+      return vmsdk::ToStringView(target_field_it->second.value.get());
+    };
 
-    auto str_a = vmsdk::ToStringView(it_a->second.value.get());
-    auto str_b = vmsdk::ToStringView(it_b->second.value.get());
+    auto op_str_a = get_sortkey_val(a);
+    auto op_str_b = get_sortkey_val(b);
+
+    if (!op_str_a || !op_str_b) {
+      // WARNING: Only both-missing is a tie; keying mixed pairs creates a
+      // comparison cycle which will result in undefined behavior in std::sort
+      if (!op_str_a && !op_str_b) {
+        return tie_breaker(a, b);
+      }
+      // Always put missing sorts last so LIMIT pages stay relevant
+      return !op_str_b;
+    }
+    auto str_a = op_str_a.value();
+    auto str_b = op_str_b.value();
 
     expr::Value val_a, val_b;
     if (is_numeric) {
@@ -368,8 +374,7 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
     if (cmp == expr::Ordering::kGREATER) {
       return sortby.order == query::SortOrder::kDescending;
     }
-    // ensure deterministic sort
-    return tie_break(a, b);
+    return tie_breaker(a, b);
   };
 
   auto amountToKeep = parameters.limit.first_index + parameters.limit.number;

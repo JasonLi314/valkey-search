@@ -1090,10 +1090,7 @@ class TestNonVector(ValkeySearchTestCaseBase):
 class TestSortByTieBreak(ValkeySearchTestCaseBase):
     """
         SORTBY ties order by document key, following the sort direction
-        (issue #1353 item 8). Previously tied documents kept the internal
-        retrieval order, which varies between nodes, and a truncating LIMIT
-        (std::partial_sort) could reorder ties so a LIMITed reply was not a
-        prefix of the unlimited one. Documents missing the sort field still
+        (issue #1353 item 8). Documents missing the sort field still
         sort last in both directions, ordered by key among themselves.
         Not strictly a Redis-compatibility fix: RediSearch breaks ties by insertion
         order, which valkey-search does not track.
