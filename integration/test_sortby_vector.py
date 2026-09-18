@@ -86,3 +86,112 @@ class TestKnnSortByStoredField(ValkeySearchTestCaseBase):
         assert result == [3, b"vsorta:3", [b"cat", b"a"],
                           b"vsorta:1", [b"cat", b"a"],
                           b"vsorta:2", [b"cat", b"a"]], "dist ASC"
+
+    def test_knn_sortby_stored_field_also_in_return(self):
+        client: Valkey = self.server.get_new_client()
+        blob = self._setup(client, "vsret_idx", "vsret:")
+        # The sort field appearing in RETURN too must not change the order,
+        # and each row carries both fields.
+        result = client.execute_command(
+            "FT.SEARCH", "vsret_idx", "*=>[KNN 3 @vec $B AS dist]",
+            "PARAMS", "2", "B", blob,
+            "SORTBY", "p", "ASC", "RETURN", "2", "cat", "p", "DIALECT", "2")
+        assert result == [3, b"vsret:2", [b"cat", b"a", b"p", b"10"],
+                          b"vsret:3", [b"cat", b"a", b"p", b"20"],
+                          b"vsret:1", [b"cat", b"a", b"p", b"30"]], "ASC"
+
+    def test_knn_sortby_schema_aliased_field(self):
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "vsal_idx", "ON", "HASH", "PREFIX", "1", "vsal:",
+            "SCHEMA", "vec", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32",
+            "DIM", "2", "DISTANCE_METRIC", "L2",
+            "cat", "TAG", "price_raw", "AS", "p", "NUMERIC") == b"OK"
+        docs = [("vsal:1", (2.0, 2.0), "30"), ("vsal:2", (3.0, 3.0), "10"),
+                ("vsal:3", (1.0, 1.0), "20")]
+        for key, vec, price in docs:
+            assert client.execute_command(
+                "HSET", key, "vec", struct.pack("<2f", *vec),
+                "cat", "a", "price_raw", price) == 3
+        waiters.wait_for_true(
+            lambda: client.execute_command(
+                "FT.SEARCH", "vsal_idx", "@cat:{a}", "NOCONTENT",
+                "DIALECT", "2")[0] == 3
+        )
+        blob = struct.pack("<2f", 0.0, 0.0)
+        # SORTBY names the schema alias while the hash stores price_raw; the
+        # sort value must be reachable under the name the comparator uses.
+        result = client.execute_command(
+            "FT.SEARCH", "vsal_idx", "*=>[KNN 3 @vec $B AS dist]",
+            "PARAMS", "2", "B", blob,
+            "SORTBY", "p", "ASC", "RETURN", "1", "cat", "DIALECT", "2")
+        assert result == [3, b"vsal:2", [b"cat", b"a"],
+                          b"vsal:3", [b"cat", b"a"],
+                          b"vsal:1", [b"cat", b"a"]], "alias ASC"
+
+    def test_knn_sortby_text_field_falls_back_to_fetch(self):
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "vstxt_idx", "ON", "HASH", "PREFIX", "1", "vstxt:",
+            "SCHEMA", "vec", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32",
+            "DIM", "2", "DISTANCE_METRIC", "L2",
+            "cat", "TAG", "name", "TEXT") == b"OK"
+        docs = [("vstxt:1", (2.0, 2.0), "cc"), ("vstxt:2", (3.0, 3.0), "aa"),
+                ("vstxt:3", (1.0, 1.0), "bb")]
+        for key, vec, name in docs:
+            assert client.execute_command(
+                "HSET", key, "vec", struct.pack("<2f", *vec),
+                "cat", "a", "name", name) == 3
+        waiters.wait_for_true(
+            lambda: client.execute_command(
+                "FT.SEARCH", "vstxt_idx", "@cat:{a}", "NOCONTENT",
+                "DIALECT", "2")[0] == 3
+        )
+        blob = struct.pack("<2f", 0.0, 0.0)
+        # TEXT has no index-served raw value, so content must fall back to
+        # the main-thread fetch; ordering still follows the field bytes.
+        result = client.execute_command(
+            "FT.SEARCH", "vstxt_idx", "*=>[KNN 3 @vec $B AS dist]",
+            "PARAMS", "2", "B", blob,
+            "SORTBY", "name", "ASC", "RETURN", "1", "cat", "DIALECT", "2")
+        assert result == [3, b"vstxt:2", [b"cat", b"a"],
+                          b"vstxt:3", [b"cat", b"a"],
+                          b"vstxt:1", [b"cat", b"a"]], "text ASC"
+
+    def test_knn_sortby_doc_missing_sort_field(self):
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "vsmiss_idx", "ON", "HASH", "PREFIX", "1", "vsmiss:",
+            "SCHEMA", "vec", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32",
+            "DIM", "2", "DISTANCE_METRIC", "L2",
+            "cat", "TAG", "p", "NUMERIC") == b"OK"
+        # vsmiss:2 lacks p entirely; distance and key orders both place it
+        # mid/early, so "missing sorts last" is the only way it ends up last.
+        assert client.execute_command(
+            "HSET", "vsmiss:1", "vec", struct.pack("<2f", 1.0, 1.0),
+            "cat", "a", "p", "20") == 3
+        assert client.execute_command(
+            "HSET", "vsmiss:2", "vec", struct.pack("<2f", 2.0, 2.0),
+            "cat", "a") == 2
+        assert client.execute_command(
+            "HSET", "vsmiss:3", "vec", struct.pack("<2f", 3.0, 3.0),
+            "cat", "a", "p", "10") == 3
+        waiters.wait_for_true(
+            lambda: client.execute_command(
+                "FT.SEARCH", "vsmiss_idx", "@cat:{a}", "NOCONTENT",
+                "DIALECT", "2")[0] == 3
+        )
+        blob = struct.pack("<2f", 0.0, 0.0)
+        query = "*=>[KNN 3 @vec $B AS dist]"
+        result = client.execute_command(
+            "FT.SEARCH", "vsmiss_idx", query, "PARAMS", "2", "B", blob,
+            "SORTBY", "p", "ASC", "RETURN", "1", "cat", "DIALECT", "2")
+        assert result == [3, b"vsmiss:3", [b"cat", b"a"],
+                          b"vsmiss:1", [b"cat", b"a"],
+                          b"vsmiss:2", [b"cat", b"a"]], "missing ASC"
+        result = client.execute_command(
+            "FT.SEARCH", "vsmiss_idx", query, "PARAMS", "2", "B", blob,
+            "SORTBY", "p", "DESC", "RETURN", "1", "cat", "DIALECT", "2")
+        assert result == [3, b"vsmiss:1", [b"cat", b"a"],
+                          b"vsmiss:3", [b"cat", b"a"],
+                          b"vsmiss:2", [b"cat", b"a"]], "missing DESC"

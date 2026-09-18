@@ -513,21 +513,44 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
   if (parameters.no_content || parameters.return_attributes.empty()) {
     return results;
   }
-  // A SORTBY on a stored field is compared against attribute_contents, and
-  // only the main-thread fetch adds that field beyond RETURN (GetContent).
-  // Index-served content carries just the RETURN attributes, so decline.
-  const bool sort_by_vec_score =
-      parameters.sortby_parameter && parameters.score_as &&
-      parameters.sortby_parameter->field ==
-          vmsdk::ToStringView(parameters.score_as.get());
-  if (parameters.sortby_parameter && !sort_by_vec_score) {
-    return results;
-  }
+
+  // collecting attributes required for both RETURN and SORTBY
+  // SORTBY is required for sorting later
   struct AttributeInfo {
-    const ReturnAttribute *attribute;
+    enum class Type { ReturnAttribute, SortByParameter };
+    Type type;
+    union {
+      const ReturnAttribute *return_attribute;
+      const SortByParameter *sortby_param;
+    };
     indexes::IndexBase *index;
   };
   std::vector<AttributeInfo> attributes;
+  // If SORTBY is on a doc field while RETURN does not specify that field, we
+  // should add it here so sorting can read it from its index.
+  const bool sort_by_vec_score =
+      parameters.sortby_parameter.has_value() && parameters.score_as &&
+      parameters.sortby_parameter->field ==
+          vmsdk::ToStringView(parameters.score_as.get());
+  if (parameters.sortby_parameter.has_value() && !sort_by_vec_score) {
+    const std::string &sortby_field = parameters.sortby_parameter->field;
+    const bool sortby_served_by_return = std::any_of(
+        parameters.return_attributes.begin(),
+        parameters.return_attributes.end(), [&](const ReturnAttribute &attr) {
+          return attr.identifier.get() &&
+                 vmsdk::ToStringView(attr.identifier.get()) == sortby_field;
+        });
+    if (!sortby_served_by_return) {
+      auto index = parameters.index_schema->GetIndex(sortby_field);
+      if (!index.ok()) {
+        return results;
+      }
+      attributes.push_back(
+          AttributeInfo{.type = AttributeInfo::Type::SortByParameter,
+                        .sortby_param = &parameters.sortby_parameter.value(),
+                        .index = index.value().get()});
+    }
+  }
   for (auto &attribute : parameters.return_attributes) {
     if (!attribute.attribute_alias.get()) {
       // Any attribute that is not indexed will result in all attributes being
@@ -539,7 +562,8 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
     if (!index.ok()) {
       return results;
     }
-    attributes.push_back(AttributeInfo{&attribute, index.value().get()});
+    attributes.push_back(AttributeInfo{AttributeInfo::Type::ReturnAttribute,
+                                       &attribute, index.value().get()});
   }
   for (auto &neighbor : *results) {
     if (neighbor.attribute_contents.has_value()) {
@@ -622,12 +646,26 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
       }
 
       if (attribute_value != nullptr) {
-        auto identifier = vmsdk::MakeUniqueValkeyString(
-            vmsdk::ToStringView(attribute_info.attribute->identifier.get()));
-        auto identifier_view = vmsdk::ToStringView(identifier.get());
-        neighbor.attribute_contents->emplace(
-            identifier_view,
-            RecordsMapValue(std::move(identifier), std::move(attribute_value)));
+        switch (attribute_info.type) {
+          case AttributeInfo::Type::ReturnAttribute: {
+            auto identifier = vmsdk::MakeUniqueValkeyString(vmsdk::ToStringView(
+                attribute_info.return_attribute->identifier.get()));
+            auto identifier_view = vmsdk::ToStringView(identifier.get());
+            neighbor.attribute_contents->emplace(
+                identifier_view, RecordsMapValue(std::move(identifier),
+                                                 std::move(attribute_value)));
+            break;
+          }
+          case AttributeInfo::Type::SortByParameter: {
+            auto identifier = vmsdk::MakeUniqueValkeyString(
+                attribute_info.sortby_param->field);
+            auto identifier_view = vmsdk::ToStringView(identifier.get());
+            neighbor.attribute_contents->emplace(
+                identifier_view, RecordsMapValue(std::move(identifier),
+                                                 std::move(attribute_value)));
+            break;
+          }
+        }
       } else {
         // Mark this neighbor as needing content retrieval via the main thread
         // (e.g. the attribute value may exist but not be indexed due to type
