@@ -513,6 +513,19 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
   if (parameters.no_content || parameters.return_attributes.empty()) {
     return results;
   }
+
+  // collecting attributes required for both RETURN and SORTBY
+  // SORTBY is required for sorting later
+  struct AttributeInfo {
+    enum class Type { ReturnAttribute, SortByParameter };
+    Type type;
+    union {
+      const ReturnAttribute *return_attribute;
+      const SortByParameter *sortby_param;
+    };
+    indexes::IndexBase *index;
+  };
+  std::vector<AttributeInfo> attributes;
   // A SORTBY on a stored field is compared against attribute_contents, and
   // only the main-thread fetch adds that field beyond RETURN (GetContent).
   // Index-served content carries just the RETURN attributes, so decline.
@@ -521,13 +534,16 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
       parameters.sortby_parameter->field ==
           vmsdk::ToStringView(parameters.score_as.get());
   if (parameters.sortby_parameter && !sort_by_vec_score) {
-    return results;
+    auto index = parameters.index_schema->GetIndex(
+        parameters.sortby_parameter.value().field);
+    if (!index.ok()) {
+      return results;
+    }
+    attributes.push_back(
+        AttributeInfo{.type = AttributeInfo::Type::SortByParameter,
+                      .sortby_param = &parameters.sortby_parameter.value(),
+                      .index = index.value().get()});
   }
-  struct AttributeInfo {
-    const ReturnAttribute *attribute;
-    indexes::IndexBase *index;
-  };
-  std::vector<AttributeInfo> attributes;
   for (auto &attribute : parameters.return_attributes) {
     if (!attribute.attribute_alias.get()) {
       // Any attribute that is not indexed will result in all attributes being
@@ -539,7 +555,8 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
     if (!index.ok()) {
       return results;
     }
-    attributes.push_back(AttributeInfo{&attribute, index.value().get()});
+    attributes.push_back(AttributeInfo{AttributeInfo::Type::ReturnAttribute,
+                                       &attribute, index.value().get()});
   }
   for (auto &neighbor : *results) {
     if (neighbor.attribute_contents.has_value()) {
@@ -622,12 +639,26 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
       }
 
       if (attribute_value != nullptr) {
-        auto identifier = vmsdk::MakeUniqueValkeyString(
-            vmsdk::ToStringView(attribute_info.attribute->identifier.get()));
-        auto identifier_view = vmsdk::ToStringView(identifier.get());
-        neighbor.attribute_contents->emplace(
-            identifier_view,
-            RecordsMapValue(std::move(identifier), std::move(attribute_value)));
+        switch (attribute_info.type) {
+          case AttributeInfo::Type::ReturnAttribute: {
+            auto identifier = vmsdk::MakeUniqueValkeyString(vmsdk::ToStringView(
+                attribute_info.return_attribute->identifier.get()));
+            auto identifier_view = vmsdk::ToStringView(identifier.get());
+            neighbor.attribute_contents->emplace(
+                identifier_view, RecordsMapValue(std::move(identifier),
+                                                 std::move(attribute_value)));
+            break;
+          }
+          case AttributeInfo::Type::SortByParameter: {
+            auto identifier = vmsdk::MakeUniqueValkeyString(
+                attribute_info.sortby_param->field);
+            auto identifier_view = vmsdk::ToStringView(identifier.get());
+            neighbor.attribute_contents->emplace(
+                identifier_view, RecordsMapValue(std::move(identifier),
+                                                 std::move(attribute_value)));
+            break;
+          }
+        }
       } else {
         // Mark this neighbor as needing content retrieval via the main thread
         // (e.g. the attribute value may exist but not be indexed due to type

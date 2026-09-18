@@ -307,11 +307,10 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
   bool is_numeric =
       index_result.ok() &&
       index_result.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
-  // Tied neighbors order by key, following the sort direction, so the result
-  // order is deterministic (solving issue #1353 item 8). Keys are unique, so
-  // the comparator below is a total order. Call only on true ties (equal
-  // values, or both missing); never on mixed value-presence; explained in
-  // caller below
+
+  // WARNING: this tie_breaker should only be used if both values are either
+  // present or missing, never mixed; calling on mixed pairs creates a
+  // comparison cycle which will result in undefined behavior in std::sort
   auto tie_breaker = [&](const indexes::Neighbor &a,
                          const indexes::Neighbor &b) -> bool {
     // external id is unique in keyspace so they will never tie
@@ -346,8 +345,7 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
     auto op_str_b = get_sortkey_val(b);
 
     if (!op_str_a || !op_str_b) {
-      // WARNING: Only both-missing is a tie; keying mixed pairs creates a
-      // comparison cycle which will result in undefined behavior in std::sort
+      // mandatory guard to prevent cyclical sorting order
       if (!op_str_a && !op_str_b) {
         return tie_breaker(a, b);
       }
