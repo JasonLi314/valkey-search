@@ -1212,7 +1212,10 @@ void ScoreTextQuery(const IndexSchema &index_schema,
 // their score.
 void ApplyHybridTextScore(const SearchParameters &parameters,
                           std::vector<indexes::Neighbor> &neighbors) {
-  if (!QueryHasTextPredicate(parameters) || neighbors.empty()) return;
+  if (parameters.vector_score_only || !QueryHasTextPredicate(parameters) ||
+      neighbors.empty()) {
+    return;
+  }
   std::vector<indexes::BorrowedNeighbor> borrowed;
   borrowed.reserve(neighbors.size());
   for (const auto &neighbor : neighbors) {
@@ -1595,7 +1598,8 @@ void SearchResult::TrimResults(std::vector<T> &vec,
       std::sort(vec.begin(), vec.end(), cmp);
     }
   } else if (parameters.IsNonVectorQuery() ||
-             QueryHasTextPredicate(parameters)) {
+             (QueryHasTextPredicate(parameters) &&
+              !parameters.vector_score_only)) {
     // Two cases sort by score descending here:
     //   - Cluster-merge non-vector path: the merged Neighbor vector is drained
     //     from the fanout heap ascending and never sorted.
@@ -1603,6 +1607,10 @@ void SearchResult::TrimResults(std::vector<T> &vec,
     //     the query score is the text relevance (set by ApplyHybridTextScore),
     //     so re-rank by it to match Redis. The vector distance is preserved on
     //     Neighbor.distance and still reported via the score_as field.
+    //
+    // A VSIM arm carrying a text pre-filter is excluded. Its score is the
+    // distance, not a relevance, so sorting by score descending would return
+    // the FARTHEST matches -- which is exactly what it did before this guard.
     // Content resolution later drops some neighbors, but drops preserve
     // relative order, so this ordering survives. Pure vector queries (no text
     // predicate) fall through and keep their distance-ascending order.
@@ -1719,8 +1727,18 @@ absl::Status Search(SearchParameters &parameters, SearchMode search_mode) {
 absl::Status SearchAsync(std::unique_ptr<SearchParameters> parameters,
                          vmsdk::ThreadPool *thread_pool,
                          SearchMode search_mode) {
-  thread_pool->Schedule(
-      [parameters = std::move(parameters), search_mode]() mutable {
+  // The parameters are parked in a holder shared between this frame and the
+  // scheduled task. ThreadPool::Schedule refuses -- and destroys -- the task
+  // once the pool is in stop mode; because the holder outlives the task, a
+  // refusal hands the parameters back here instead of dropping them (and the
+  // completion callback they carry) inside a task that never runs. On the
+  // accepted path the task moves them out of the holder on its single run, so
+  // they are owned in exactly one place at any time.
+  auto holder = std::make_shared<std::unique_ptr<SearchParameters>>(
+      std::move(parameters));
+  const bool scheduled = thread_pool->Schedule(
+      [holder, search_mode]() mutable {
+        std::unique_ptr<SearchParameters> parameters = std::move(*holder);
         auto res = Search(*parameters, search_mode);
         BACKGROUND_PAUSEPOINT("background_search_completing");
         parameters->search_result.status = res;
@@ -1739,6 +1757,15 @@ absl::Status SearchAsync(std::unique_ptr<SearchParameters> parameters,
         }
       },
       vmsdk::ThreadPool::Priority::kHigh);
+  if (!scheduled) {
+    // Reclaim and destroy the parameters here; the caller is told the search
+    // will never run so it can terminate whatever is waiting on it. Unavailable
+    // is deliberate: the only way Schedule refuses is a pool in stop mode, i.e.
+    // this node is shutting down, which the coordinator maps to gRPC
+    // UNAVAILABLE ("retry elsewhere") rather than a query defect.
+    parameters = std::move(*holder);
+    return absl::UnavailableError(kShuttingDownMsg);
+  }
   return absl::OkStatus();
 }
 
