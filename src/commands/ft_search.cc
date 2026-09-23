@@ -9,11 +9,13 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/base/casts.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -331,7 +333,7 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
 
     auto get_sortkey_val = [&](const indexes::Neighbor &neighbor)
         -> std::optional<absl::string_view> {
-      if (!neighbor.attribute_contents) {
+      if (!neighbor.attribute_contents.has_value()) {
         return std::nullopt;
       }
       auto target_field_it = neighbor.attribute_contents->find(sortby.field);
@@ -344,23 +346,37 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
     auto op_str_a = get_sortkey_val(a);
     auto op_str_b = get_sortkey_val(b);
 
-    if (!op_str_a || !op_str_b) {
+    if (!op_str_a.has_value() || !op_str_b.has_value()) {
       // mandatory guard to prevent cyclical sorting order
-      if (!op_str_a && !op_str_b) {
+      if (!op_str_a.has_value() && !op_str_b.has_value()) {
         return tie_breaker(a, b);
       }
       // missing docs last so LIMIT pages stay relevant
-      return !op_str_b;
+      return !op_str_b.has_value();
     }
     auto str_a = op_str_a.value();
     auto str_b = op_str_b.value();
 
     expr::Value val_a, val_b;
     if (is_numeric) {
-      auto num_a = vmsdk::To<double>(str_a).value_or(0.0);
-      auto num_b = vmsdk::To<double>(str_b).value_or(0.0);
-      val_a = expr::Value(num_a);
-      val_b = expr::Value(num_b);
+      // vmsdk::To<double> rejects only the bare "nan" spelling; "-nan" or
+      // "nan(2)" still parse to a real NaN. Fold NaN to a real value: NaN
+      // compares kUNORDERED, which would send a non-tie into tie_breaker and
+      // break strict weak ordering (cyclic comparator, UB). Rejecting NaN in
+      // vmsdk::To instead is a policy change (it would alter FT.AGGREGATE
+      // behavior) tracked separately; this local fold stays regardless.
+      auto to_sortable_double = [](absl::string_view s) {
+        const double d = vmsdk::To<double>(s).value_or(0.0);
+        // Bit-pattern NaN test: built-in isnan is unreliable under
+        // -ffast-math (see expr/value.cc).
+        const uint64_t v = absl::bit_cast<uint64_t>(d);
+        const bool is_nan =
+            (v & 0x7FF0000000000000ull) == 0x7FF0000000000000ull &&
+            (v & 0x000FFFFFFFFFFFFFull) != 0;
+        return is_nan ? 0.0 : d;
+      };
+      val_a = expr::Value(to_sortable_double(str_a));
+      val_b = expr::Value(to_sortable_double(str_b));
     } else {
       val_a = expr::Value(str_a);
       val_b = expr::Value(str_b);

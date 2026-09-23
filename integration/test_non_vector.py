@@ -1159,6 +1159,60 @@ class TestSortByTieBreak(ValkeySearchTestCaseBase):
                           [b"m", b"all"], b"tie_miss:4", [b"m", b"all"],
                           b"tie_miss:3", [b"m", b"all"]]
 
+class TestSortByNanValues(ValkeySearchTestCaseBase):
+    """
+        NaN spellings that survive parsing ("-nan", "+nan", "nan(2)") must
+        sort exactly like the parse-rejected spellings ("nan", unparseable
+        bytes): as 0.0, tie-broken by key (issue #1353 item 8 hardening).
+        Without the fold, a parsed NaN compares unordered against every
+        value and falls into the key tie-break, breaking strict weak
+        ordering (cyclic comparator, path-dependent order). No
+        Redis-compat surface: RediSearch refuses to index a document whose
+        numeric field is any NaN spelling, so this pins valkey-search's
+        own deterministic behavior.
+    """
+
+    def test_sortby_nan_folds_to_zero(self):
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "nansort_idx", "ON", "HASH", "PREFIX", "1",
+            "nansort:", "SCHEMA", "m", "TAG", "p", "NUMERIC") == b"OK"
+        # Keys chosen so the zero cluster's key order differs from where
+        # the un-folded comparator would drift the NaN docs (keys 8,9 sort
+        # after "nansort:5" under pure key ties). Load order matches
+        # neither key order nor its reverse.
+        docs = [("nansort:8", "+nan"), ("nansort:1", "-3"),
+                ("nansort:5", "5"), ("nansort:9", "-nan"),
+                ("nansort:3", "0"), ("nansort:4", "nan")]
+        for key, p in docs:
+            assert client.execute_command(
+                "HSET", key, "m", "all", "p", p) == 2
+        waiters.wait_for_true(
+            lambda: client.execute_command(
+                "FT.SEARCH", "nansort_idx", "@m:{all}", "NOCONTENT",
+                "DIALECT", "2")[0] == 6
+        )
+
+        # Zero cluster {3 (0), 4 (nan), 8 (+nan), 9 (-nan)} sits between
+        # -3 and 5, keyed-ordered following the sort direction.
+        asc = [6, b"nansort:1", [b"p", b"-3"],
+               b"nansort:3", [b"p", b"0"],
+               b"nansort:4", [b"p", b"nan"],
+               b"nansort:8", [b"p", b"+nan"],
+               b"nansort:9", [b"p", b"-nan"],
+               b"nansort:5", [b"p", b"5"]]
+        desc = [6, b"nansort:5", [b"p", b"5"],
+                b"nansort:9", [b"p", b"-nan"],
+                b"nansort:8", [b"p", b"+nan"],
+                b"nansort:4", [b"p", b"nan"],
+                b"nansort:3", [b"p", b"0"],
+                b"nansort:1", [b"p", b"-3"]]
+        for direction, full in (("ASC", asc), ("DESC", desc)):
+            result = client.execute_command(
+                "FT.SEARCH", "nansort_idx", "@m:{all}", "SORTBY", "p",
+                direction, "RETURN", "1", "p", "DIALECT", "2")
+            assert result == full, f"SORTBY {direction}"
+
 class TestSortKeyPrefixGate(ValkeySearchTestCaseDebugMode):
     """
         The WITHSORTKEYS sort-key prefix ('#' for NUMERIC, '$' otherwise;

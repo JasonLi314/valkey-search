@@ -514,15 +514,11 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
     return results;
   }
 
-  // collecting attributes required for both RETURN and SORTBY
-  // SORTBY is required for sorting later
+  // Collect the attributes to serve from indexes: the RETURN fields plus the
+  // SORTBY field that the sort comparator reads later.
   struct AttributeInfo {
-    enum class Type { ReturnAttribute, SortByParameter };
-    Type type;
-    union {
-      const ReturnAttribute *return_attribute;
-      const SortByParameter *sortby_param;
-    };
+    // Bag key; views memory owned by `parameters`.
+    absl::string_view identifier;
     indexes::IndexBase *index;
   };
   std::vector<AttributeInfo> attributes;
@@ -545,10 +541,8 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
       if (!index.ok()) {
         return results;
       }
-      attributes.push_back(
-          AttributeInfo{.type = AttributeInfo::Type::SortByParameter,
-                        .sortby_param = &parameters.sortby_parameter.value(),
-                        .index = index.value().get()});
+      attributes.push_back(AttributeInfo{.identifier = sortby_field,
+                                         .index = index.value().get()});
     }
   }
   for (auto &attribute : parameters.return_attributes) {
@@ -562,8 +556,9 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
     if (!index.ok()) {
       return results;
     }
-    attributes.push_back(AttributeInfo{AttributeInfo::Type::ReturnAttribute,
-                                       &attribute, index.value().get()});
+    attributes.push_back(AttributeInfo{
+        .identifier = vmsdk::ToStringView(attribute.identifier.get()),
+        .index = index.value().get()});
   }
   for (auto &neighbor : *results) {
     if (neighbor.attribute_contents.has_value()) {
@@ -587,6 +582,8 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
               dynamic_cast<indexes::Numeric *>(attribute_info.index);
           const auto *numeric = numeric_index->GetValue(neighbor.external_id);
           if (numeric != nullptr) {
+            // TODO: re-serialized bytes ("10.50" -> "10.5"); values equal in
+            // the first 12 significant digits collapse to a tie.
             attribute_value =
                 vmsdk::MakeUniqueValkeyString(expr::FormatDouble(*numeric));
           }
@@ -646,26 +643,12 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
       }
 
       if (attribute_value != nullptr) {
-        switch (attribute_info.type) {
-          case AttributeInfo::Type::ReturnAttribute: {
-            auto identifier = vmsdk::MakeUniqueValkeyString(vmsdk::ToStringView(
-                attribute_info.return_attribute->identifier.get()));
-            auto identifier_view = vmsdk::ToStringView(identifier.get());
-            neighbor.attribute_contents->emplace(
-                identifier_view, RecordsMapValue(std::move(identifier),
-                                                 std::move(attribute_value)));
-            break;
-          }
-          case AttributeInfo::Type::SortByParameter: {
-            auto identifier = vmsdk::MakeUniqueValkeyString(
-                attribute_info.sortby_param->field);
-            auto identifier_view = vmsdk::ToStringView(identifier.get());
-            neighbor.attribute_contents->emplace(
-                identifier_view, RecordsMapValue(std::move(identifier),
-                                                 std::move(attribute_value)));
-            break;
-          }
-        }
+        auto identifier =
+            vmsdk::MakeUniqueValkeyString(attribute_info.identifier);
+        auto identifier_view = vmsdk::ToStringView(identifier.get());
+        neighbor.attribute_contents->emplace(
+            identifier_view,
+            RecordsMapValue(std::move(identifier), std::move(attribute_value)));
       } else {
         // Mark this neighbor as needing content retrieval via the main thread
         // (e.g. the attribute value may exist but not be indexed due to type
