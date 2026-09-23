@@ -1162,7 +1162,7 @@ class TestSortByTieBreak(ValkeySearchTestCaseBase):
 class TestSortByNanValues(ValkeySearchTestCaseBase):
     """
         NaN spellings that survive parsing ("-nan", "+nan", "nan(2)") must
-        sort exactly like the parse-rejected spellings ("nan", unparseable
+        sort exactly like the parse-rejected spellings ("nan", un-parseable
         bytes): as 0.0, tie-broken by key (issue #1353 item 8 hardening).
         Without the fold, a parsed NaN compares unordered against every
         value and falls into the key tie-break, breaking strict weak
