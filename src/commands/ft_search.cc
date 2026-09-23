@@ -310,9 +310,10 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
       index_result.ok() &&
       index_result.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
 
-  // WARNING: this tie_breaker should only be used if both values are either
-  // present or missing, never mixed; calling on mixed pairs creates a
-  // comparison cycle which will result in undefined behavior in std::sort
+  // WARNING: this tie_breaker should only be used if both values are 1)
+  // present and equal, or 2) both missing. Never call on mixed pair as it can
+  // create a comparison cycle which will result in undefined behavior in
+  // std::sort
   auto tie_breaker = [&](const indexes::Neighbor &a,
                          const indexes::Neighbor &b) -> bool {
     // external id is unique in keyspace so they will never tie
@@ -360,11 +361,11 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
     expr::Value val_a, val_b;
     if (is_numeric) {
       // vmsdk::To<double> rejects only the bare "nan" spelling; "-nan" or
-      // "nan(2)" still parse to a real NaN. Fold NaN to a real value: NaN
-      // compares kUNORDERED, which would send a non-tie into tie_breaker and
-      // break strict weak ordering (cyclic comparator, UB). Rejecting NaN in
-      // vmsdk::To instead is a policy change (it would alter FT.AGGREGATE
-      // behavior) tracked separately; this local fold stays regardless.
+      // "nan(2)" still parse to a real NaN. We have to fold NaN to real value
+      // as NaN comparison yields kUNORDERED, which would send the comparison
+      // pair to tie_breaker causing UB. Currently vmsdk::To is used by
+      // FT.AGGREGATE and cannot be easily altered due to that dependency hence
+      // the guard rests here.
       auto to_sortable_double = [](absl::string_view s) {
         const double d = vmsdk::To<double>(s).value_or(0.0);
         // Bit-pattern NaN test: built-in isnan is unreliable under
