@@ -116,6 +116,14 @@ bool IsSortByFieldNumeric(const SearchCommand &command,
          idx.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
 }
 
+// Gated fix for divergence with Redis search (issue #1353, item 5); expanded
+// once so both serializers share one INFO counter.
+bool NilAbsentSortKey() {
+  return VALKEY_SEARCH_COMPATIBILITY_FIX(
+      1, 3, 0, "ft_search_sortkey_nil", [&]() { return true; },
+      [&]() { return false; });
+}
+
 void SerializeNeighbors(ValkeyModuleCtx *ctx,
                         const query::SearchResult &search_result,
                         const SearchCommand &parameters) {
@@ -139,10 +147,7 @@ void SerializeNeighbors(ValkeyModuleCtx *ctx,
         return IsSortByFieldNumeric(parameters, sort_by_vec_score) ? "#" : "$";
       },
       [&]() -> std::string { return "#"; });
-  // Gated fix for divergence with Redis search (issue #1353, item 5)
-  const bool nil_absent_sort_key = VALKEY_SEARCH_COMPATIBILITY_FIX(
-      1, 3, 0, "ft_search_sortkey_nil", [&]() { return true; },
-      [&]() { return false; });
+  const bool nil_absent_sort_key = NilAbsentSortKey();
 
   const size_t elements_per_result =
       2 + (emit_top_level_score ? 1 : 0) + (emit_sort_key ? 1 : 0);
@@ -248,10 +253,7 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
           return IsSortByFieldNumeric(command, false) ? "#" : "$";
         },
         [&]() -> std::string { return "#"; });
-    // Gated fix for divergence with Redis search (issue #1353, item 5)
-    nil_absent_sort_key = VALKEY_SEARCH_COMPATIBILITY_FIX(
-        1, 3, 0, "ft_search_sortkey_nil", [&]() { return true; },
-        [&]() { return false; });
+    nil_absent_sort_key = NilAbsentSortKey();
   }
 
   for (size_t i = range.start_index; i < range.end_index; ++i) {
