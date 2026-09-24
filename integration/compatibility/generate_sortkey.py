@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from .data_sets import SORTKEY_PREFIX_DATA_SET
+from .data_sets import SORTKEY_NUMERIC_FORMAT_DATA_SET, SORTKEY_PREFIX_DATA_SET
 from .generate import BaseCompatibilityTest
 
 '''
@@ -47,3 +47,19 @@ class TestSortKeyPrefixCompatibility(BaseCompatibilityTest):
                    "PARAMS", "2", "B", b"AAAAAAAA", # identical vector in SORTKEY_PREFIX_DATA_SET
                    "SORTBY", "dist", "ASC", "WITHSORTKEYS",
                    "RETURN", "1", "dist", "DIALECT", "2")
+
+    def test_numeric_sortkey_and_return_format(self, key_type):
+        # Numeric re-serialization (issue #1353 item 6): sort keys and RETURN
+        # values come from the parsed double, not the stored bytes.
+        self.setup_data(SORTKEY_NUMERIC_FORMAT_DATA_SET, key_type)
+        time.sleep(0.5)
+        self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{all}",
+                   "SORTBY", "p", "ASC", "WITHSORTKEYS",
+                   "RETURN", "1", "p", "DIALECT", "2")
+        # Non-SORTABLE NUMERIC field: same treatment.
+        self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{all}",
+                   "SORTBY", "q", "ASC", "WITHSORTKEYS",
+                   "RETURN", "1", "q", "DIALECT", "2")
+        # RETURN normalizes without SORTBY (single-document match).
+        self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{solo}",
+                   "RETURN", "1", "p", "DIALECT", "2")

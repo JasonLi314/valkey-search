@@ -1248,6 +1248,12 @@ def compute_filter_data_sets(dataset_name):
 # future JSON variant: add SETS/CREATES "json" entries here.
 SORTKEY_PREFIX_DATA_SET = "sortkey prefix"
 
+# Fixture for numeric re-serialization (issue #1353 item 6): stored bytes
+# cover integer, trailing-zero, scientific, signed-zero, high-precision and
+# out-of-integer-range shapes. All distinct as doubles (no sort ties); p is
+# SORTABLE, q is not.
+SORTKEY_NUMERIC_FORMAT_DATA_SET = "sortkey numeric format"
+
 
 def compute_sortkey_data_sets():
     schema = ("m TAG z TEXT SORTABLE t TAG n NUMERIC f NUMERIC "
@@ -1266,7 +1272,26 @@ def compute_sortkey_data_sets():
             CREATES_KEY("hash"): [
                 f"FT.CREATE hash_idx1 ON HASH PREFIX 1 hash: SCHEMA {schema}"
             ],
-        }
+        },
+        SORTKEY_NUMERIC_FORMAT_DATA_SET: {
+            SETS_KEY("hash"): [
+                ("hash:nfm1", {"m": "all,solo", "p": "2.500", "q": "2.500"}),
+                ("hash:nfm2", {"m": "all", "p": "1e3", "q": "1e3"}),
+                ("hash:nfm3", {"m": "all", "p": "10", "q": "10"}),
+                ("hash:nfm4", {"m": "all", "p": "-0", "q": "-0"}),
+                ("hash:nfm5", {"m": "all", "p": "0.1", "q": "0.1"}),
+                ("hash:nfm6", {"m": "all", "p": "3.14159265358979",
+                               "q": "3.14159265358979"}),
+                ("hash:nfm7", {"m": "all", "p": "1e20", "q": "1e20"}),
+                ("hash:nfm8", {"m": "all", "p": "1e-7", "q": "1e-7"}),
+                ("hash:nfm9", {"m": "all", "p": "1152921504606846976",
+                               "q": "1152921504606846976"}),
+            ],
+            CREATES_KEY("hash"): [
+                "FT.CREATE hash_idx1 ON HASH PREFIX 1 hash: SCHEMA "
+                "m TAG p NUMERIC SORTABLE q NUMERIC"
+            ],
+        },
     }
 
 
@@ -1301,7 +1326,8 @@ def load_data(client, data_set, key_type, data_source=None, schema_type="default
             data_source = "text"
         elif data_set in FILTER_DATASETS:
             data_source = "filter"
-        elif data_set == SORTKEY_PREFIX_DATA_SET:
+        elif data_set in (SORTKEY_PREFIX_DATA_SET,
+                          SORTKEY_NUMERIC_FORMAT_DATA_SET):
             data_source = "sortkey"
         elif data_set == RETURN_CLAUSE_DATA_SET:
             data_source = "return"

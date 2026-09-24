@@ -1087,6 +1087,56 @@ class TestNonVector(ValkeySearchTestCaseBase):
         create_bulk_data_standalone(client)
         validate_tag_and_negate_queries(client)
 
+    def test_numeric_sortkey_and_return_normalized(self):
+        """
+            Regression test for issue #1353, item 6: NUMERIC sort keys and
+            RETURN values are re-serialized from the parsed double, not the
+            stored bytes. Sort keys keep round-trip precision; RETURN values
+            render integral values as integers and others at 12 significant
+            digits. Full-content replies keep the stored bytes. Bytes match
+            Redis (redis:latest 8.10.1).
+        """
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "CONFIG", "SET", "search.emulate-release", "1.3.0") == b"OK"
+
+        assert client.execute_command(
+            "FT.CREATE", "num_fmt_idx", "ON", "HASH", "PREFIX", "1", "nfm:",
+            "SCHEMA", "p", "NUMERIC", "SORTABLE") == b"OK"
+        for key, value in (("nfm:1", "10"), ("nfm:2", "1e20"),
+                           ("nfm:3", "2.500"), ("nfm:4", "-0"),
+                           ("nfm:5", "3.14159265358979"), ("nfm:6", "0.1"),
+                           ("nfm:7", "1e3"), ("nfm:8", "1e-7"),
+                           ("nfm:9", "1152921504606846976")):
+            assert client.execute_command("HSET", key, "p", value) == 1
+
+        result = client.execute_command(
+            "FT.SEARCH", "num_fmt_idx", "*", "SORTBY", "p", "ASC",
+            "WITHSORTKEYS", "RETURN", "1", "p", "DIALECT", "2")
+        assert result == [
+            9,
+            b"nfm:4", b"#-0",                     [b"p", b"0"],
+            b"nfm:8", b"#9.9999999999999995e-08", [b"p", b"1e-07"],
+            b"nfm:6", b"#0.10000000000000001",    [b"p", b"0.1"],
+            b"nfm:3", b"#2.5",                    [b"p", b"2.5"],
+            b"nfm:5", b"#3.14159265358979",       [b"p", b"3.14159265359"],
+            b"nfm:1", b"#10",                     [b"p", b"10"],
+            b"nfm:7", b"#1000",                   [b"p", b"1000"],
+            b"nfm:9", b"#1.152921504606847e+18",  [b"p", b"1152921504606846976"],
+            b"nfm:2", b"#1e+20",                  [b"p", b"1e+20"],
+        ]
+
+        # Full-content replies (no RETURN) keep the stored bytes; only the
+        # sort-key slot is re-serialized.
+        result = client.execute_command(
+            "FT.SEARCH", "num_fmt_idx", "*", "SORTBY", "p", "ASC",
+            "WITHSORTKEYS", "LIMIT", "0", "2", "DIALECT", "2")
+        assert result == [
+            9,
+            b"nfm:4", b"#-0",                     [b"p", b"-0"],
+            b"nfm:8", b"#9.9999999999999995e-08", [b"p", b"1e-7"],
+        ]
+
 class TestSortKeyPrefixGate(ValkeySearchTestCaseDebugMode):
     """
         The WITHSORTKEYS sort-key prefix ('#' for NUMERIC, '$' otherwise;
@@ -1172,6 +1222,30 @@ class TestReturnClauseGate(ValkeySearchTestCaseDebugMode):
                 "FT.SEARCH", "rcg_idx", "@m:{all}", "NOCONTENT",
                 "RETURN", "1", "title", "DIALECT", "2")
             assert result == id_only, f"emulate-release {release}"
+
+
+class TestNumericFormatGate(ValkeySearchTestCaseDebugMode):
+    """
+        Numeric sort-key and RETURN re-serialization (issue #1353 item 6) is
+        gated on search.emulate-release: pre-1.3.0 echoed the stored bytes.
+    """
+
+    def test_numeric_format_gate(self):
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "nfg_idx", "ON", "HASH", "PREFIX", "1", "nfg:",
+            "SCHEMA", "m", "TAG", "p", "NUMERIC", "SORTABLE") == b"OK"
+        assert client.execute_command(
+            "HSET", "nfg:1", "m", "all", "p", "2.500") == 2
+        for release, sort_key, ret in (("1.2.1", b"#2.500", b"2.500"),
+                                       ("1.3.0", b"#2.5", b"2.5")):
+            assert client.execute_command(
+                "CONFIG", "SET", "search.emulate-release", release) == b"OK"
+            result = client.execute_command(
+                "FT.SEARCH", "nfg_idx", "@m:{all}", "SORTBY", "p", "ASC",
+                "WITHSORTKEYS", "RETURN", "1", "p", "DIALECT", "2")
+            assert result == [1, b"nfg:1", sort_key,
+                              [b"p", ret]], f"emulate-release {release}"
 
 
 class TestAggregateReducerAlias(ValkeySearchTestCaseDebugMode):

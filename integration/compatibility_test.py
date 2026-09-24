@@ -573,6 +573,7 @@ def compare_results(expected, results):
     # 1-element stride the unpacker cannot parse. Both data sets are fully
     # deterministic, so compare them raw.
     if expected.get("data_set_name") in (SORTKEY_PREFIX_DATA_SET,
+                                         SORTKEY_NUMERIC_FORMAT_DATA_SET,
                                          RETURN_CLAUSE_DATA_SET):
         if expected["result"] == results["result"]:
             return True
