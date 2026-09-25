@@ -55,11 +55,11 @@ class TestSortKeyPrefixCompatibility(BaseCompatibilityTest):
         time.sleep(0.5)
         self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{all}",
                    "SORTBY", "p", "ASC", "WITHSORTKEYS",
-                   "RETURN", "1", "p", "DIALECT", "2")
+                   "RETURN", "1", "p", "LIMIT", "0", "20", "DIALECT", "2")
         # Non-SORTABLE NUMERIC field: same treatment.
         self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{all}",
                    "SORTBY", "q", "ASC", "WITHSORTKEYS",
-                   "RETURN", "1", "q", "DIALECT", "2")
+                   "RETURN", "1", "q", "LIMIT", "0", "20", "DIALECT", "2")
         # RETURN normalizes without SORTBY (single-document match).
         self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{solo}",
                    "RETURN", "1", "p", "DIALECT", "2")

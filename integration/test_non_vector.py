@@ -1107,14 +1107,23 @@ class TestNonVector(ValkeySearchTestCaseBase):
                            ("nfm:3", "2.500"), ("nfm:4", "-0"),
                            ("nfm:5", "3.14159265358979"), ("nfm:6", "0.1"),
                            ("nfm:7", "1e3"), ("nfm:8", "1e-7"),
-                           ("nfm:9", "1152921504606846976")):
+                           ("nfm:9", "1152921504606846976"),
+                           ("nfm:10", "-9223372036854775808"),
+                           ("nfm:11", "9223372036854774784"),
+                           ("nfm:12", "9223372036854775807"),
+                           ("nfm:13", "9223372036854777856"),
+                           ("nfm:14", "9007199254740993")):
             assert client.execute_command("HSET", key, "p", value) == 1
 
+        # Integral values in [-2^63, 2^63) render as integers; INT64_MAX
+        # parses to 2^63 and goes scientific. 2^53+1 rounds at parse time.
         result = client.execute_command(
             "FT.SEARCH", "num_fmt_idx", "*", "SORTBY", "p", "ASC",
-            "WITHSORTKEYS", "RETURN", "1", "p", "DIALECT", "2")
+            "WITHSORTKEYS", "RETURN", "1", "p", "LIMIT", "0", "20",
+            "DIALECT", "2")
         assert result == [
-            9,
+            14,
+            b"nfm:10", b"#-9.2233720368547758e+18", [b"p", b"-9223372036854775808"],
             b"nfm:4", b"#-0",                     [b"p", b"0"],
             b"nfm:8", b"#9.9999999999999995e-08", [b"p", b"1e-07"],
             b"nfm:6", b"#0.10000000000000001",    [b"p", b"0.1"],
@@ -1122,7 +1131,11 @@ class TestNonVector(ValkeySearchTestCaseBase):
             b"nfm:5", b"#3.14159265358979",       [b"p", b"3.14159265359"],
             b"nfm:1", b"#10",                     [b"p", b"10"],
             b"nfm:7", b"#1000",                   [b"p", b"1000"],
+            b"nfm:14", b"#9007199254740992",      [b"p", b"9007199254740992"],
             b"nfm:9", b"#1.152921504606847e+18",  [b"p", b"1152921504606846976"],
+            b"nfm:11", b"#9.2233720368547748e+18", [b"p", b"9223372036854774784"],
+            b"nfm:12", b"#9.2233720368547758e+18", [b"p", b"9.22337203685e+18"],
+            b"nfm:13", b"#9.2233720368547779e+18", [b"p", b"9.22337203685e+18"],
             b"nfm:2", b"#1e+20",                  [b"p", b"1e+20"],
         ]
 
@@ -1132,9 +1145,9 @@ class TestNonVector(ValkeySearchTestCaseBase):
             "FT.SEARCH", "num_fmt_idx", "*", "SORTBY", "p", "ASC",
             "WITHSORTKEYS", "LIMIT", "0", "2", "DIALECT", "2")
         assert result == [
-            9,
+            14,
+            b"nfm:10", b"#-9.2233720368547758e+18", [b"p", b"-9223372036854775808"],
             b"nfm:4", b"#-0",                     [b"p", b"-0"],
-            b"nfm:8", b"#9.9999999999999995e-08", [b"p", b"1e-7"],
         ]
 
 class TestSortKeyPrefixGate(ValkeySearchTestCaseDebugMode):

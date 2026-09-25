@@ -8,6 +8,7 @@
 #include <strings.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -36,6 +37,15 @@
 namespace valkey_search {
 
 namespace {
+// Reply text formats for doubles. Sort keys round-trip the exact double;
+// RETURN values and scores use 12 significant digits (Redis-compatible).
+constexpr absl::string_view kSortKeyDoubleFormat = "%.17g";
+constexpr absl::string_view kReturnValueDoubleFormat = "%.12g";
+constexpr absl::string_view kScoreFormat = "%.12g";
+// RETURN values in [-2^63, 2^63) render as integers (Redis-compatible, probed
+// to one ULP on both sides). 2^63 is exact as a double.
+constexpr double kReturnValueIntegerBound = static_cast<double>(1ULL << 63);
+
 // FT.SEARCH idx "*=>[KNN 10 @vec $BLOB AS score]" PARAMS 2 BLOB
 // "\x12\xa9\xf5\x6c" DIALECT 2
 
@@ -69,11 +79,13 @@ void SendReplyNoContent(ValkeyModuleCtx *ctx,
   const bool has_relevance = HasTextRelevance(parameters);
   ValkeyModule_ReplyWithArray(ctx, (emit_score ? 2 : 1) * range.count() + 1);
   ReplyAvailNeighbors(ctx, search_result, parameters);
-  for (auto i = range.start_index; i < range.end_index; ++i) {
+  for (auto reply_neighbor_idx = range.start_index;
+       reply_neighbor_idx < range.end_index; ++reply_neighbor_idx) {
+    const auto &neighbor = neighbors[reply_neighbor_idx];
     ValkeyModule_ReplyWithString(
-        ctx, vmsdk::MakeUniqueValkeyString(*neighbors[i].external_id).get());
+        ctx, vmsdk::MakeUniqueValkeyString(*neighbor.external_id).get());
     if (emit_score) {
-      ReplyScoreTopLevel(ctx, has_relevance ? neighbors[i].score : 0.0f);
+      ReplyScoreTopLevel(ctx, has_relevance ? neighbor.score : 0.0f);
     }
   }
 }
@@ -84,7 +96,7 @@ void ReplyScore(ValkeyModuleCtx *ctx, ValkeyModuleString &score_as,
   // The score_as field carries the vector distance (Redis' __<field>_score).
   // For pure vector queries Neighbor.score == distance; for hybrid text=>[KNN]
   // queries Neighbor.score is the text relevance while distance stays here.
-  auto score_value = absl::StrFormat("%.12g", neighbor.distance);
+  auto score_value = absl::StrFormat(kScoreFormat, neighbor.distance);
   ValkeyModule_ReplyWithString(
       ctx, vmsdk::MakeUniqueValkeyString(score_value).get());
 }
@@ -92,7 +104,7 @@ void ReplyScore(ValkeyModuleCtx *ctx, ValkeyModuleString &score_as,
 // Reply with just the score value as a top-level element (Redis WITHSCORES
 // format: score appears between document ID and attributes array).
 void ReplyScoreTopLevel(ValkeyModuleCtx *ctx, float score) {
-  auto score_value = absl::StrFormat("%.12g", score);
+  auto score_value = absl::StrFormat(kScoreFormat, score);
   ValkeyModule_ReplyWithString(
       ctx, vmsdk::MakeUniqueValkeyString(score_value).get());
 }
@@ -113,44 +125,6 @@ bool IsSortByFieldNumeric(const SearchCommand &command,
     return false;
   }
   auto idx = command.index_schema->GetIndex(command.sortby_parameter->field);
-  return idx.ok() &&
-         idx.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
-}
-
-// Redis re-serializes NUMERIC values from the parsed double, not the stored
-// bytes (issue #1353, item 6). Sort keys use round-trip precision.
-std::string FormatNumericSortKey(absl::string_view raw) {
-  double value;
-  if (!absl::SimpleAtod(raw, &value)) {
-    return std::string(raw);
-  }
-  return absl::StrFormat("%.17g", value);
-}
-
-// RETURN values render integral doubles as integers, others at 12 sig digits.
-// The range check keeps the cast defined; out-of-range values use %.12g.
-std::string FormatNumericReturnValue(absl::string_view raw) {
-  double value;
-  if (!absl::SimpleAtod(raw, &value)) {
-    return std::string(raw);
-  }
-  if (value >= -9223372036854775808.0 && value < 9223372036854775808.0) {
-    const long long integral = static_cast<long long>(value);
-    if (static_cast<double>(integral) == value) {
-      return absl::StrFormat("%d", integral);
-    }
-  }
-  return absl::StrFormat("%.12g", value);
-}
-
-// True when the RETURN attribute resolved to a NUMERIC schema attribute.
-bool IsReturnAttributeNumeric(const query::ReturnAttribute &attribute,
-                              const IndexSchema &index_schema) {
-  if (!attribute.attribute_alias) {
-    return false;
-  }
-  auto idx = index_schema.GetIndex(
-      vmsdk::ToStringView(attribute.attribute_alias.get()));
   return idx.ok() &&
          idx.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
 }
@@ -184,25 +158,27 @@ void SerializeNeighbors(ValkeyModuleCtx *ctx,
   ValkeyModule_ReplyWithArray(ctx, elements_per_result * range.count() + 1);
   ReplyAvailNeighbors(ctx, search_result, parameters);
 
-  for (auto i = range.start_index; i < range.end_index; ++i) {
+  for (auto reply_neighbor_idx = range.start_index;
+       reply_neighbor_idx < range.end_index; ++reply_neighbor_idx) {
+    const auto &neighbor = neighbors[reply_neighbor_idx];
     ValkeyModule_ReplyWithString(
-        ctx, vmsdk::MakeUniqueValkeyString(*neighbors[i].external_id).get());
+        ctx, vmsdk::MakeUniqueValkeyString(*neighbor.external_id).get());
     if (emit_top_level_score) {
-      ReplyScoreTopLevel(ctx, has_relevance ? neighbors[i].score : 0.0f);
+      ReplyScoreTopLevel(ctx, has_relevance ? neighbor.score : 0.0f);
     }
     if (emit_sort_key) {
       std::string value = sort_by_vec_score
-                              ? absl::StrFormat("%.12g", neighbors[i].distance)
-                              : GetSortKeyValue(neighbors[i], parameters);
+                              ? absl::StrFormat(kScoreFormat, neighbor.distance)
+                              : GetSortKeyValue(neighbor, parameters);
       std::string prefixed_value = sort_key_prefix + value;
       ValkeyModule_ReplyWithString(
           ctx, vmsdk::MakeUniqueValkeyString(prefixed_value).get());
     }
     if (parameters.return_attributes.empty()) {
       ValkeyModule_ReplyWithArray(
-          ctx, 2 * neighbors[i].attribute_contents.value().size() + 2);
-      ReplyScore(ctx, *parameters.score_as, neighbors[i]);
-      for (auto &attribute_content : neighbors[i].attribute_contents.value()) {
+          ctx, 2 * neighbor.attribute_contents.value().size() + 2);
+      ReplyScore(ctx, *parameters.score_as, neighbor);
+      for (auto &attribute_content : neighbor.attribute_contents.value()) {
         ValkeyModule_ReplyWithString(ctx,
                                      attribute_content.second.GetIdentifier());
         ValkeyModule_ReplyWithString(ctx, attribute_content.second.value.get());
@@ -213,13 +189,13 @@ void SerializeNeighbors(ValkeyModuleCtx *ctx,
       for (const auto &return_attribute : parameters.return_attributes) {
         if (vmsdk::ToStringView(parameters.score_as.get()) ==
             vmsdk::ToStringView(return_attribute.identifier.get())) {
-          ReplyScore(ctx, *parameters.score_as, neighbors[i]);
+          ReplyScore(ctx, *parameters.score_as, neighbor);
           ++cnt;
           continue;
         }
-        auto it = neighbors[i].attribute_contents.value().find(
+        auto it = neighbor.attribute_contents.value().find(
             vmsdk::ToStringView(return_attribute.identifier.get()));
-        if (it != neighbors[i].attribute_contents.value().end()) {
+        if (it != neighbor.attribute_contents.value().end()) {
           ValkeyModule_ReplyWithString(ctx, return_attribute.alias.get());
           ValkeyModule_ReplyWithString(ctx, it->second.value.get());
           ++cnt;
@@ -244,6 +220,46 @@ std::string GetSortKeyValue(const indexes::Neighbor &neighbor,
   }
 
   return std::string(vmsdk::ToStringView(it->second.value.get()));
+}
+
+// Redis re-serializes NUMERIC values from the parsed double, not the stored
+// bytes (issue #1353, item 6). Sort keys use round-trip precision.
+std::string FormatNumericSortKey(absl::string_view raw) {
+  double value;
+  if (!absl::SimpleAtod(raw, &value)) {
+    return std::string(raw);
+  }
+  return absl::StrFormat(kSortKeyDoubleFormat, value);
+}
+
+// RETURN values render in-range integral doubles as integers (-0 as 0), others
+// at 12 significant digits. Stays in the double domain: no int cast, no UB.
+std::string FormatNumericReturnValue(absl::string_view raw) {
+  double value;
+  if (!absl::SimpleAtod(raw, &value)) {
+    return std::string(raw);
+  }
+  // Text-level: -ffast-math (no-signed-zeros) may fold double-level -0 fixes.
+  if (value == 0.0) {
+    return "0";
+  }
+  if (value >= -kReturnValueIntegerBound && value < kReturnValueIntegerBound &&
+      value == std::floor(value)) {
+    return absl::StrFormat("%.0f", value);
+  }
+  return absl::StrFormat(kReturnValueDoubleFormat, value);
+}
+
+// True when the RETURN attribute resolved to a NUMERIC schema attribute.
+bool IsReturnAttributeNumeric(const query::ReturnAttribute &ret_attr,
+                              const IndexSchema &index_schema) {
+  if (!ret_attr.attribute_alias) {
+    return false;
+  }
+  auto idx = index_schema.GetIndex(
+      vmsdk::ToStringView(ret_attr.attribute_alias.get()));
+  return idx.ok() &&
+         idx.value()->GetIndexerType() == indexes::IndexerType::kNumeric;
 }
 
 // Handle non-vector queries by processing the neighbors and replying with the
@@ -277,37 +293,42 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
         [&]() -> std::string { return "#"; });
   }
 
-  // Gated fix for divergence with Redis search (issue #1353, item 6)
-  const bool format_numeric = VALKEY_SEARCH_COMPATIBILITY_FIX(
+  // Gated fix for divergence with Redis search (issue #1353, item 6). One
+  // expansion: each expansion registers its own INFO counter under the label.
+  const bool is_numeric_format_enabled = VALKEY_SEARCH_COMPATIBILITY_FIX(
       1, 3, 0, "ft_search_numeric_format", [&]() { return true; },
       [&]() { return false; });
-  const bool numeric_sort_key = format_numeric && command.with_sort_keys &&
-                                IsSortByFieldNumeric(command, false);
-  // One schema lookup per RETURN attribute, not per row.
-  std::vector<bool> numeric_return_attribute;
-  if (format_numeric) {
-    numeric_return_attribute.reserve(command.return_attributes.size());
-    for (const auto &attribute : command.return_attributes) {
-      numeric_return_attribute.push_back(
-          IsReturnAttributeNumeric(attribute, *command.index_schema));
+  const bool is_sort_key_numeric = is_numeric_format_enabled &&
+                                   command.with_sort_keys &&
+                                   IsSortByFieldNumeric(command, false);
+  // Gate folded in; one schema lookup per RETURN attribute, not per row.
+  std::vector<bool> is_ret_attr_numeric(command.return_attributes.size(),
+                                        false);
+  if (is_numeric_format_enabled) {
+    for (size_t ret_attr_idx = 0; ret_attr_idx < is_ret_attr_numeric.size();
+         ++ret_attr_idx) {
+      is_ret_attr_numeric[ret_attr_idx] = IsReturnAttributeNumeric(
+          command.return_attributes[ret_attr_idx], *command.index_schema);
     }
   }
 
-  for (size_t i = range.start_index; i < range.end_index; ++i) {
+  for (size_t reply_neighbor_idx = range.start_index;
+       reply_neighbor_idx < range.end_index; ++reply_neighbor_idx) {
+    const auto &neighbor = neighbors[reply_neighbor_idx];
     // Document ID
     ValkeyModule_ReplyWithString(
-        ctx, vmsdk::MakeUniqueValkeyString(*neighbors[i].external_id).get());
+        ctx, vmsdk::MakeUniqueValkeyString(*neighbor.external_id).get());
 
     // Score as top-level element when WITHSCORES is specified
     if (command.with_scores) {
-      ReplyScoreTopLevel(ctx, neighbors[i].score);
+      ReplyScoreTopLevel(ctx, neighbor.score);
     }
 
     // Prefix the sort key: '#' for NUMERIC fields, '$' for string fields
     // (RediSearch-compatible).
     if (command.with_sort_keys) {
-      std::string sort_key_value = GetSortKeyValue(neighbors[i], command);
-      if (numeric_sort_key) {
+      std::string sort_key_value = GetSortKeyValue(neighbor, command);
+      if (is_sort_key_numeric) {
         sort_key_value = FormatNumericSortKey(sort_key_value);
       }
       std::string value_with_prefix = prefix_str + sort_key_value;
@@ -315,7 +336,7 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
           ctx, vmsdk::MakeUniqueValkeyString(value_with_prefix).get());
     }
 
-    const auto &contents = neighbors[i].attribute_contents.value();
+    const auto &contents = neighbor.attribute_contents.value();
 
     if (command.return_attributes.empty()) {
       ValkeyModule_ReplyWithArray(ctx, 2 * contents.size());
@@ -327,13 +348,13 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
     } else {
       ValkeyModule_ReplyWithArray(ctx, VALKEYMODULE_POSTPONED_LEN);
       size_t cnt = 0;
-      for (size_t j = 0; j < command.return_attributes.size(); ++j) {
-        const auto &return_attribute = command.return_attributes[j];
-        auto it = contents.find(
-            vmsdk::ToStringView(return_attribute.identifier.get()));
+      for (size_t ret_attr_idx = 0;
+           ret_attr_idx < command.return_attributes.size(); ++ret_attr_idx) {
+        const auto &ret_attr = command.return_attributes[ret_attr_idx];
+        auto it = contents.find(vmsdk::ToStringView(ret_attr.identifier.get()));
         if (it != contents.end()) {
-          ValkeyModule_ReplyWithString(ctx, return_attribute.alias.get());
-          if (format_numeric && numeric_return_attribute[j]) {
+          ValkeyModule_ReplyWithString(ctx, ret_attr.alias.get());
+          if (is_ret_attr_numeric[ret_attr_idx]) {
             std::string value = FormatNumericReturnValue(
                 vmsdk::ToStringView(it->second.value.get()));
             ValkeyModule_ReplyWithString(

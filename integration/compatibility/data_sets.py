@@ -1249,9 +1249,9 @@ def compute_filter_data_sets(dataset_name):
 SORTKEY_PREFIX_DATA_SET = "sortkey prefix"
 
 # Fixture for numeric re-serialization (issue #1353 item 6): stored bytes
-# cover integer, trailing-zero, scientific, signed-zero, high-precision and
-# out-of-integer-range shapes. All distinct as doubles (no sort ties); p is
-# SORTABLE, q is not.
+# cover integer, trailing-zero, scientific, signed-zero, high-precision,
+# int64-boundary and out-of-integer-range shapes. All distinct as doubles (no
+# sort ties); p is SORTABLE, q is not.
 SORTKEY_NUMERIC_FORMAT_DATA_SET = "sortkey numeric format"
 
 
@@ -1286,6 +1286,19 @@ def compute_sortkey_data_sets():
                 ("hash:nfm8", {"m": "all", "p": "1e-7", "q": "1e-7"}),
                 ("hash:nfm9", {"m": "all", "p": "1152921504606846976",
                                "q": "1152921504606846976"}),
+                # int64 boundary: -2^63 and 2^63-1ULP render as integers;
+                # INT64_MAX parses to 2^63 and goes scientific, as does +1ULP.
+                ("hash:nfm10", {"m": "all", "p": "-9223372036854775808",
+                                "q": "-9223372036854775808"}),
+                ("hash:nfm11", {"m": "all", "p": "9223372036854774784",
+                                "q": "9223372036854774784"}),
+                ("hash:nfm12", {"m": "all", "p": "9223372036854775807",
+                                "q": "9223372036854775807"}),
+                ("hash:nfm13", {"m": "all", "p": "9223372036854777856",
+                                "q": "9223372036854777856"}),
+                # 2^53+1: parse rounds to 2^53, formatting does not.
+                ("hash:nfm14", {"m": "all", "p": "9007199254740993",
+                                "q": "9007199254740993"}),
             ],
             CREATES_KEY("hash"): [
                 "FT.CREATE hash_idx1 ON HASH PREFIX 1 hash: SCHEMA "
