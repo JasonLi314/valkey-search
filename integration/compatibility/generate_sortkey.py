@@ -2,7 +2,8 @@ import time
 
 import pytest
 
-from .data_sets import SORTKEY_NUMERIC_FORMAT_DATA_SET, SORTKEY_PREFIX_DATA_SET
+from .data_sets import (SORTKEY_NUMERIC_FORMAT_DATA_SET,
+                        SORTKEY_NUMERIC_FORMAT_VALUES, SORTKEY_PREFIX_DATA_SET)
 from .generate import BaseCompatibilityTest
 
 '''
@@ -53,13 +54,17 @@ class TestSortKeyPrefixCompatibility(BaseCompatibilityTest):
         # values come from the parsed double, not the stored bytes.
         self.setup_data(SORTKEY_NUMERIC_FORMAT_DATA_SET, key_type)
         time.sleep(0.5)
+        limit = str(len(SORTKEY_NUMERIC_FORMAT_VALUES))
         self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{all}",
                    "SORTBY", "p", "ASC", "WITHSORTKEYS",
-                   "RETURN", "1", "p", "LIMIT", "0", "20", "DIALECT", "2")
+                   "RETURN", "1", "p", "LIMIT", "0", limit, "DIALECT", "2")
         # Non-SORTABLE NUMERIC field: same treatment.
         self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{all}",
                    "SORTBY", "q", "ASC", "WITHSORTKEYS",
-                   "RETURN", "1", "q", "LIMIT", "0", "20", "DIALECT", "2")
+                   "RETURN", "1", "q", "LIMIT", "0", limit, "DIALECT", "2")
+        # No full-content (no RETURN) check here: valkey-search emits content
+        # fields in a nondeterministic order, so a raw compare is flaky. The
+        # stored-bytes pass-through is pinned in test_non_vector.py.
         # RETURN normalizes without SORTBY (single-document match).
         self.check("FT.SEARCH", f"{key_type}_idx1", "@m:{solo}",
                    "RETURN", "1", "p", "DIALECT", "2")

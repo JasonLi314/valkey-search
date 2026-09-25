@@ -8,6 +8,8 @@ from valkey.cluster import ValkeyCluster
 from valkey_search_test_case import ValkeySearchClusterTestCase
 import time
 import pytest
+from compatibility.data_sets import SORTKEY_NUMERIC_FORMAT_VALUES
+from numeric_format import redis_return_value, redis_sort_key
 from utils import IndexingTestHelper
 from valkeytestframework.util import waiters
 
@@ -1091,64 +1093,46 @@ class TestNonVector(ValkeySearchTestCaseBase):
         """
             Regression test for issue #1353, item 6: NUMERIC sort keys and
             RETURN values are re-serialized from the parsed double, not the
-            stored bytes. Sort keys keep round-trip precision; RETURN values
-            render integral values as integers and others at 12 significant
-            digits. Full-content replies keep the stored bytes. Bytes match
-            Redis (redis:latest 8.10.1).
+            stored bytes (rule in numeric_format.py). Full-content replies
+            keep the stored bytes. The same inputs are compat-tested against
+            Redis, so the rule here and the oracle pickle check each other.
         """
         client: Valkey = self.server.get_new_client()
         assert client.execute_command(
             "CONFIG", "SET", "search.emulate-release", "1.3.0") == b"OK"
 
+        values = SORTKEY_NUMERIC_FORMAT_VALUES
+        parsed = [float(v) for v in values]
+        assert parsed == sorted(parsed) and len(set(parsed)) == len(parsed), \
+            "fixture must be strictly ascending as doubles"
+
         assert client.execute_command(
             "FT.CREATE", "num_fmt_idx", "ON", "HASH", "PREFIX", "1", "nfm:",
             "SCHEMA", "p", "NUMERIC", "SORTABLE") == b"OK"
-        for key, value in (("nfm:1", "10"), ("nfm:2", "1e20"),
-                           ("nfm:3", "2.500"), ("nfm:4", "-0"),
-                           ("nfm:5", "3.14159265358979"), ("nfm:6", "0.1"),
-                           ("nfm:7", "1e3"), ("nfm:8", "1e-7"),
-                           ("nfm:9", "1152921504606846976"),
-                           ("nfm:10", "-9223372036854775808"),
-                           ("nfm:11", "9223372036854774784"),
-                           ("nfm:12", "9223372036854775807"),
-                           ("nfm:13", "9223372036854777856"),
-                           ("nfm:14", "9007199254740993")):
+        keys = [f"nfm:{i}".encode() for i in range(len(values))]
+        for key, value in zip(keys, values):
             assert client.execute_command("HSET", key, "p", value) == 1
+        limit = str(len(values))
 
-        # Integral values in [-2^63, 2^63) render as integers; INT64_MAX
-        # parses to 2^63 and goes scientific. 2^53+1 rounds at parse time.
         result = client.execute_command(
             "FT.SEARCH", "num_fmt_idx", "*", "SORTBY", "p", "ASC",
-            "WITHSORTKEYS", "RETURN", "1", "p", "LIMIT", "0", "20",
+            "WITHSORTKEYS", "RETURN", "1", "p", "LIMIT", "0", limit,
             "DIALECT", "2")
-        assert result == [
-            14,
-            b"nfm:10", b"#-9.2233720368547758e+18", [b"p", b"-9223372036854775808"],
-            b"nfm:4", b"#-0",                     [b"p", b"0"],
-            b"nfm:8", b"#9.9999999999999995e-08", [b"p", b"1e-07"],
-            b"nfm:6", b"#0.10000000000000001",    [b"p", b"0.1"],
-            b"nfm:3", b"#2.5",                    [b"p", b"2.5"],
-            b"nfm:5", b"#3.14159265358979",       [b"p", b"3.14159265359"],
-            b"nfm:1", b"#10",                     [b"p", b"10"],
-            b"nfm:7", b"#1000",                   [b"p", b"1000"],
-            b"nfm:14", b"#9007199254740992",      [b"p", b"9007199254740992"],
-            b"nfm:9", b"#1.152921504606847e+18",  [b"p", b"1152921504606846976"],
-            b"nfm:11", b"#9.2233720368547748e+18", [b"p", b"9223372036854774784"],
-            b"nfm:12", b"#9.2233720368547758e+18", [b"p", b"9.22337203685e+18"],
-            b"nfm:13", b"#9.2233720368547779e+18", [b"p", b"9.22337203685e+18"],
-            b"nfm:2", b"#1e+20",                  [b"p", b"1e+20"],
-        ]
+        expected = [len(values)]
+        for key, value in zip(keys, values):
+            expected += [key, redis_sort_key(value),
+                         [b"p", redis_return_value(value)]]
+        assert result == expected
 
         # Full-content replies (no RETURN) keep the stored bytes; only the
         # sort-key slot is re-serialized.
         result = client.execute_command(
             "FT.SEARCH", "num_fmt_idx", "*", "SORTBY", "p", "ASC",
-            "WITHSORTKEYS", "LIMIT", "0", "2", "DIALECT", "2")
-        assert result == [
-            14,
-            b"nfm:10", b"#-9.2233720368547758e+18", [b"p", b"-9223372036854775808"],
-            b"nfm:4", b"#-0",                     [b"p", b"-0"],
-        ]
+            "WITHSORTKEYS", "LIMIT", "0", limit, "DIALECT", "2")
+        expected = [len(values)]
+        for key, value in zip(keys, values):
+            expected += [key, redis_sort_key(value), [b"p", value.encode()]]
+        assert result == expected
 
 class TestSortKeyPrefixGate(ValkeySearchTestCaseDebugMode):
     """
@@ -1248,10 +1232,13 @@ class TestNumericFormatGate(ValkeySearchTestCaseDebugMode):
         assert client.execute_command(
             "FT.CREATE", "nfg_idx", "ON", "HASH", "PREFIX", "1", "nfg:",
             "SCHEMA", "m", "TAG", "p", "NUMERIC", "SORTABLE") == b"OK"
+        value = "2.500"
         assert client.execute_command(
-            "HSET", "nfg:1", "m", "all", "p", "2.500") == 2
-        for release, sort_key, ret in (("1.2.1", b"#2.500", b"2.500"),
-                                       ("1.3.0", b"#2.5", b"2.5")):
+            "HSET", "nfg:1", "m", "all", "p", value) == 2
+        stored = value.encode()
+        for release, sort_key, ret in (
+                ("1.2.1", b"#" + stored, stored),
+                ("1.3.0", redis_sort_key(value), redis_return_value(value))):
             assert client.execute_command(
                 "CONFIG", "SET", "search.emulate-release", release) == b"OK"
             result = client.execute_command(

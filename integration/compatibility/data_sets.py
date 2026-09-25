@@ -1,4 +1,5 @@
 import itertools, valkey, json, struct, random
+from numeric_format import INT64_MAX, INT64_MIN, TWO_POW_53, ulp_above, ulp_below
 
 ### Reusable Data ###
 #
@@ -1248,11 +1249,28 @@ def compute_filter_data_sets(dataset_name):
 # future JSON variant: add SETS/CREATES "json" entries here.
 SORTKEY_PREFIX_DATA_SET = "sortkey prefix"
 
-# Fixture for numeric re-serialization (issue #1353 item 6): stored bytes
-# cover integer, trailing-zero, scientific, signed-zero, high-precision,
-# int64-boundary and out-of-integer-range shapes. All distinct as doubles (no
-# sort ties); p is SORTABLE, q is not.
+# Fixture for numeric re-serialization (issue #1353 item 6). Stored values
+# cover integer, trailing-zero, scientific, signed-zero, high-precision and
+# int64-boundary shapes. Listed in ascending numeric order, all distinct as
+# doubles (no sort ties); the regression test asserts both.
 SORTKEY_NUMERIC_FORMAT_DATA_SET = "sortkey numeric format"
+SORTKEY_NUMERIC_FORMAT_VALUES = [
+    str(ulp_below(INT64_MIN)),  # below -2^63: scientific
+    str(INT64_MIN),             # -2^63 exactly: integer
+    "-0",                       # RETURN drops the sign, sort key keeps it
+    "1e-7",
+    "0.1",
+    "2.500",
+    "3.14159265358979",         # 15 digits: RETURN rounds to 12
+    "10",
+    "1e3",
+    str(TWO_POW_53 + 1),        # parse rounds to 2^53, format does not
+    str(1 << 60),
+    str(ulp_below(INT64_MAX)),  # last double below 2^63: integer
+    str(INT64_MAX),             # parses to 2^63: scientific
+    str(ulp_above(INT64_MAX)),  # scientific
+    "1e20",
+]
 
 
 def compute_sortkey_data_sets():
@@ -1274,31 +1292,11 @@ def compute_sortkey_data_sets():
             ],
         },
         SORTKEY_NUMERIC_FORMAT_DATA_SET: {
+            # First doc also carries tag "solo" for the single-match query.
             SETS_KEY("hash"): [
-                ("hash:nfm1", {"m": "all,solo", "p": "2.500", "q": "2.500"}),
-                ("hash:nfm2", {"m": "all", "p": "1e3", "q": "1e3"}),
-                ("hash:nfm3", {"m": "all", "p": "10", "q": "10"}),
-                ("hash:nfm4", {"m": "all", "p": "-0", "q": "-0"}),
-                ("hash:nfm5", {"m": "all", "p": "0.1", "q": "0.1"}),
-                ("hash:nfm6", {"m": "all", "p": "3.14159265358979",
-                               "q": "3.14159265358979"}),
-                ("hash:nfm7", {"m": "all", "p": "1e20", "q": "1e20"}),
-                ("hash:nfm8", {"m": "all", "p": "1e-7", "q": "1e-7"}),
-                ("hash:nfm9", {"m": "all", "p": "1152921504606846976",
-                               "q": "1152921504606846976"}),
-                # int64 boundary: -2^63 and 2^63-1ULP render as integers;
-                # INT64_MAX parses to 2^63 and goes scientific, as does +1ULP.
-                ("hash:nfm10", {"m": "all", "p": "-9223372036854775808",
-                                "q": "-9223372036854775808"}),
-                ("hash:nfm11", {"m": "all", "p": "9223372036854774784",
-                                "q": "9223372036854774784"}),
-                ("hash:nfm12", {"m": "all", "p": "9223372036854775807",
-                                "q": "9223372036854775807"}),
-                ("hash:nfm13", {"m": "all", "p": "9223372036854777856",
-                                "q": "9223372036854777856"}),
-                # 2^53+1: parse rounds to 2^53, formatting does not.
-                ("hash:nfm14", {"m": "all", "p": "9007199254740993",
-                                "q": "9007199254740993"}),
+                (f"hash:nfm{i}", {"m": "all,solo" if i == 1 else "all",
+                                  "p": v, "q": v})
+                for i, v in enumerate(SORTKEY_NUMERIC_FORMAT_VALUES, 1)
             ],
             CREATES_KEY("hash"): [
                 "FT.CREATE hash_idx1 ON HASH PREFIX 1 hash: SCHEMA "
