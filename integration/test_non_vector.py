@@ -1200,6 +1200,46 @@ class TestAggregateReducerAlias(ValkeySearchTestCaseDebugMode):
                 row = dict(zip(result[i][::2], result[i][1::2]))
                 assert alias in row, f"{release}: expected {alias} in {list(row)}"
 
+
+class TestInvalidDataCountersGate(ValkeySearchTestCaseDebugMode):
+    """
+        From 1.3.0 a key dropped for invalid data leaves num_docs and each
+        dropping write adds one to hash_indexing_failures; before 1.3.0 the
+        key stays and hash_indexing_failures counts fields that produced
+        nothing to index (see COMPATIBILITY.md).
+    """
+
+    def test_invalid_data_counters_gate(self):
+        client: Valkey = self.server.get_new_client()
+        counter = "search_compatibility-ft_info_hash_indexing_failures"
+        for release, prefix, expected, legacy_calls in (
+            ("1.3.0", "idc_new:", [(1, 0), (1, 1), (0, 2), (1, 2), (2, 2), (3, 2)], 0),
+            ("1.2.1", "idc_old:", [(1, 0), (2, 2), (2, 2), (2, 2), (3, 3), (4, 3)], 6),
+        ):
+            assert client.execute_command(
+                "CONFIG", "SET", "search.emulate-release", release) == b"OK"
+            index = prefix + "idx"
+            assert client.execute_command(
+                "FT.CREATE", index, "ON", "HASH", "PREFIX", "1", prefix,
+                "SCHEMA", "p", "NUMERIC", "q", "NUMERIC", "t", "TAG") == b"OK"
+            IndexingTestHelper.wait_for_backfill_complete_on_node(client, index)
+            counter_before = client.info("search").get(counter, 0)
+            writes = (
+                ("HSET", prefix + "1", "p", "5", "q", "6", "t", "x"),
+                ("HSET", prefix + "2", "p", "abc", "q", "abc", "t", "x"),
+                ("HSET", prefix + "1", "p", "abc"),
+                ("HSET", prefix + "1", "p", "7"),
+                ("HSET", prefix + "3", "p", "1", "q", "1", "t", ""),
+                ("HSET", prefix + "4", "t", "x"),
+            )
+            for write, counters in zip(writes, expected):
+                client.execute_command(*write)
+                info = IndexingTestHelper.get_ft_info(client, index)
+                assert (info.num_docs, info.hash_indexing_failures) == counters, (
+                    f"emulate-release {release} after {write}")
+            assert client.info("search").get(counter, 0) - counter_before == legacy_calls
+
+
 class TestNonVectorCluster(ValkeySearchClusterTestCase):
 
     def test_non_vector_cluster(self):

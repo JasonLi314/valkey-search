@@ -132,12 +132,16 @@ class IndexSchema : public KeyspaceEventSubscription,
     // Number of documents excluded from the index because they did not satisfy
     // the FILTER expression.
     uint64_t filter_rejected_keys{0};
+    // Writes dropped for invalid data (one per write, incremented on a worker).
+    std::atomic<uint64_t> invalid_data_rejected_keys{0};
     uint64_t mutation_queue_size_ ABSL_GUARDED_BY(mutex_){0};
     absl::Duration mutations_queue_delay_ ABSL_GUARDED_BY(mutex_);
     mutable absl::Mutex mutex_;
 
     // Single interface to get all stats data
     InfoIndexPartitionData GetStats() const;
+    // The legacy value counts fields that produced nothing to index.
+    uint64_t HashIndexingFailures(bool invalid_data_drops_key) const;
   };
   std::shared_ptr<IndexSchema> GetSharedPtr() { return shared_from_this(); }
   std::weak_ptr<IndexSchema> GetWeakPtr() { return weak_from_this(); }
@@ -583,6 +587,8 @@ class IndexSchema : public KeyspaceEventSubscription,
   // the entire key when any field contains invalid data.
   void RemoveKeyFromAllIndexes(ValkeyModuleCtx *ctx, const Key &key)
       ABSL_SHARED_LOCKS_REQUIRED(time_sliced_mutex_);
+  // Main thread. A newer write to the key keeps its entry.
+  void EraseDbKeyInfo(const Key &key, MutationSequenceNumber sequence_number);
   static void BackfillScanCallback(ValkeyModuleCtx *ctx,
                                    ValkeyModuleString *keyname,
                                    ValkeyModuleKey *key, void *privdata);
@@ -663,6 +669,7 @@ class IndexSchema : public KeyspaceEventSubscription,
   FRIEND_TEST(IndexSchemaFriendTest, WeightedBuffer);
   FRIEND_TEST(IndexSchemaFriendTest, MutatedAttributesSanity);
   FRIEND_TEST(IndexSchemaFriendTest, InvalidDataDropsKey);
+  FRIEND_TEST(IndexSchemaFriendTest, InvalidDataDropErasesDbKeyInfo);
   FRIEND_TEST(IndexSchemaFriendTest,
               InTrackedMutationRecordsAfterConsumeNoCrash);
   FRIEND_TEST(ValkeySearchTest, Info);

@@ -810,6 +810,7 @@ void IndexSchema::SyncProcessMutation(ValkeyModuleCtx *ctx,
     // thread; we use a statically-constructed counter instead (see above).
     if (options::EnabledInVersion(1, 3, 0)) {
       RemoveKeyFromAllIndexes(ctx, key);
+      ++stats_.invalid_data_rejected_keys;
     } else {
       invalid_data_drops_key_compat_counter.Increment();
     }
@@ -828,10 +829,40 @@ void IndexSchema::RemoveKeyFromAllIndexes(ValkeyModuleCtx *ctx,
     // per-attribute Text index tracking was already cleared by RemoveRecord.
     text_index_schema_->DeleteKeyData(key);
   }
+  std::optional<MutationSequenceNumber> sequence_number;
   {
     absl::MutexLock lock(&mutated_records_mutex_);
-    index_key_info_.erase(key);
+    auto itr = index_key_info_.find(key);
+    if (itr != index_key_info_.end()) {
+      sequence_number = itr->second.mutation_sequence_number_;
+      index_key_info_.erase(itr);
+    }
   }
+  if (!sequence_number.has_value()) {
+    return;
+  }
+  vmsdk::RunByMain([weak_index_schema = GetWeakPtr(), key,
+                    sequence_number = *sequence_number]() {
+    if (auto index_schema = weak_index_schema.lock()) {
+      index_schema->EraseDbKeyInfo(key, sequence_number);
+    }
+  });
+}
+
+void IndexSchema::EraseDbKeyInfo(const Key &key,
+                                 MutationSequenceNumber sequence_number) {
+  auto &dbkeyinfo_map = db_key_info_.Get();
+  auto itr = dbkeyinfo_map.find(key);
+  if (itr == dbkeyinfo_map.end() ||
+      itr->second.mutation_sequence_number_ != sequence_number) {
+    return;
+  }
+  for (const auto &attr_info : itr->second.GetAttributeInfoVec()) {
+    attributes_indexed_data_size_[attr_info.GetPosition()] -=
+        attr_info.GetSize();
+  }
+  dbkeyinfo_map.erase(itr);
+  stats_.document_cnt = dbkeyinfo_map.size();
 }
 
 bool IndexSchema::ProcessAttributeMutation(ValkeyModuleCtx *ctx,
@@ -1363,9 +1394,15 @@ void IndexSchema::RespondWithInfo(ValkeyModuleCtx *ctx) const {
       ctx, text_index_schema_ ? text_index_schema_->GetNumUniqueTerms() : 0);
 
   // Text Index info fields end
+  // 1.3.0 counts writes dropped for invalid data, as Redisearch does.
+  const bool invalid_data_drops_key = VALKEY_SEARCH_COMPATIBILITY_FIX(
+      1, 3, 0, "ft_info_hash_indexing_failures", [] { return true; },
+      [] { return false; });
+  const uint64_t hash_indexing_failures =
+      stats_.HashIndexingFailures(invalid_data_drops_key);
   ValkeyModule_ReplyWithSimpleString(ctx, "hash_indexing_failures");
   ValkeyModule_ReplyWithCString(
-      ctx, absl::StrFormat("%lu", stats_.subscription_add.skipped_cnt).c_str());
+      ctx, absl::StrFormat("%lu", hash_indexing_failures).c_str());
 
   ValkeyModule_ReplyWithSimpleString(ctx, "filter_rejected_keys");
   ValkeyModule_ReplyWithCString(
@@ -2303,11 +2340,18 @@ size_t IndexSchema::GetMutatedRecordsSize() const {
   return tracked_mutated_records_.size();
 }
 
+uint64_t IndexSchema::Stats::HashIndexingFailures(
+    bool invalid_data_drops_key) const {
+  return invalid_data_drops_key ? invalid_data_rejected_keys.load()
+                                : subscription_add.skipped_cnt.load();
+}
+
 IndexSchema::InfoIndexPartitionData IndexSchema::Stats::GetStats() const {
   absl::MutexLock lock(&mutex_);
   return InfoIndexPartitionData{
       .num_docs = document_cnt,
-      .hash_indexing_failures = subscription_add.skipped_cnt,
+      .hash_indexing_failures =
+          HashIndexingFailures(options::EnabledInVersion(1, 3, 0)),
       .backfill_inqueue_tasks = backfill_inqueue_tasks,
       .mutation_queue_size = mutation_queue_size_,
       .recent_mutations_queue_delay =

@@ -2288,6 +2288,45 @@ ABSL_NO_THREAD_SAFETY_ANALYSIS {
   VMSDK_EXPECT_OK(options::GetEmulateRelease().SetValue(saved_emulate_release));
 }
 
+TEST_F(IndexSchemaFriendTest, InvalidDataDropErasesDbKeyInfo)
+ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  auto numeric_index =
+      std::make_shared<indexes::Numeric>(CreateNumericIndexProto());
+  VMSDK_EXPECT_OK(index_schema->AddIndex("numeric_id", "numeric_identifier",
+                                         numeric_index));
+  const auto saved_emulate_release = options::GetEmulateRelease().GetValue();
+  VMSDK_EXPECT_OK(
+      options::GetEmulateRelease().SetValue(vmsdk::ValkeyVersion(1, 3, 0)));
+
+  auto track = [&](const InternedStringPtr &key, MutationSequenceNumber db_seq,
+                   MutationSequenceNumber index_seq) {
+    index_schema->SetDbMutationSequenceNumber(key, db_seq);
+    absl::MutexLock lock(&index_schema->mutated_records_mutex_);
+    index_schema->index_key_info_[key].mutation_sequence_number_ = index_seq;
+  };
+  auto process_invalid = [&](const InternedStringPtr &key) {
+    IndexSchema::MutatedAttributes mutated;
+    mutated["numeric_id"] = AttributeData(vmsdk::MakeUniqueValkeyString("abc"));
+    index_schema->SyncProcessMutation(&fake_ctx, mutated, key);
+    kMockValkeyModule->RunPendingOneShots();
+  };
+
+  auto dropped_key = StringInternStore::Intern("dropped_key");
+  track(dropped_key, 7, 7);
+  process_invalid(dropped_key);
+  EXPECT_FALSE(index_schema->db_key_info_.Get().contains(dropped_key));
+  EXPECT_EQ(index_schema->stats_.invalid_data_rejected_keys, 1);
+
+  // A write that arrived after the dropped one keeps the key.
+  auto rewritten_key = StringInternStore::Intern("rewritten_key");
+  track(rewritten_key, 9, 8);
+  process_invalid(rewritten_key);
+  EXPECT_TRUE(index_schema->db_key_info_.Get().contains(rewritten_key));
+  EXPECT_EQ(index_schema->stats_.invalid_data_rejected_keys, 2);
+
+  VMSDK_EXPECT_OK(options::GetEmulateRelease().SetValue(saved_emulate_release));
+}
+
 void IndexSchemaFriendTest::VerifyVectorIndexConsistency(
     const std::shared_ptr<indexes::VectorBase> &vector_index,
     const std::string &attr_id) {
