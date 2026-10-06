@@ -313,13 +313,28 @@ bool CheckSlotOwnership(ValkeyModuleCtx *ctx, absl::string_view key) {
   return cluster_map->IOwnSlot(static_cast<uint16_t>(slot));
 }
 
+// Copies the SORTBY attribute's value out of a fetched document into
+// out_sort_value; leaves it null when the document lacks the attribute.
+void ExtractSortValue(const RecordsMap &content,
+                      absl::string_view sortby_identifier,
+                      vmsdk::UniqueValkeyString *out_sort_value) {
+  if (out_sort_value == nullptr || sortby_identifier.empty()) {
+    return;
+  }
+  auto itr = content.find(sortby_identifier);
+  if (itr != content.end()) {
+    *out_sort_value = vmsdk::RetainUniqueValkeyString(itr->second.value.get());
+  }
+}
+
 absl::StatusOr<RecordsMap> GetContentNoReturnJson(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     const query::SearchParameters &parameters,
     const indexes::Neighbor &neighbor,
     const std::optional<std::string> &vector_identifier,
     std::unique_ptr<query::SingleDocumentScorer> &document_scorer,
-    std::optional<float> *out_recomputed_score = nullptr) {
+    std::optional<float> *out_recomputed_score = nullptr,
+    vmsdk::UniqueValkeyString *out_sort_value = nullptr) {
   auto key = neighbor.external_id->Str();
   absl::flat_hash_set<absl::string_view> identifiers;
   identifiers.insert(kJsonRootElementQuery);
@@ -354,6 +369,7 @@ absl::StatusOr<RecordsMap> GetContentNoReturnJson(
   VMSDK_ASSIGN_OR_RETURN(auto content, attribute_data_type.FetchAllAttributes(
                                            ctx, vector_identifier,
                                            key_obj.get(), key, identifiers));
+  ExtractSortValue(content, sortby_identifier, out_sort_value);
   if (parameters.filter_parse_results.filter_identifiers.empty()) {
     // When returning early, we need to rename the sortby field from the
     // resolved identifier (e.g., "$.n1") back to the alias (e.g., "n1")
@@ -409,14 +425,15 @@ absl::StatusOr<RecordsMap> GetContent(
     const indexes::Neighbor &neighbor,
     const std::optional<std::string> &vector_identifier,
     std::unique_ptr<query::SingleDocumentScorer> &document_scorer,
-    std::optional<float> *out_recomputed_score = nullptr) {
+    std::optional<float> *out_recomputed_score = nullptr,
+    vmsdk::UniqueValkeyString *out_sort_value = nullptr) {
   auto key = neighbor.external_id->Str();
   if (attribute_data_type.ToProto() ==
           data_model::AttributeDataType::ATTRIBUTE_DATA_TYPE_JSON &&
       parameters.return_attributes.empty()) {
     return GetContentNoReturnJson(ctx, attribute_data_type, parameters,
                                   neighbor, vector_identifier, document_scorer,
-                                  out_recomputed_score);
+                                  out_recomputed_score, out_sort_value);
   }
   absl::flat_hash_set<absl::string_view> identifiers;
   for (const auto &return_attribute : parameters.return_attributes) {
@@ -461,6 +478,7 @@ absl::StatusOr<RecordsMap> GetContent(
                          attribute_data_type.FetchAllAttributes(
                              ctx, vector_identifier, key_obj.get(),
                              neighbor.external_id->Str(), identifiers));
+  ExtractSortValue(content, sortby_identifier, out_sort_value);
   if (parameters.filter_parse_results.filter_identifiers.empty()) {
     return content;
   }
@@ -609,9 +627,10 @@ void ProcessNeighborsForReply(
       continue;
     }
     std::optional<float> recomputed_score;
-    auto content =
-        GetContent(ctx, attribute_data_type, parameters, neighbor,
-                   vector_identifier, document_scorer, &recomputed_score);
+    vmsdk::UniqueValkeyString sort_value;
+    auto content = GetContent(ctx, attribute_data_type, parameters, neighbor,
+                              vector_identifier, document_scorer,
+                              &recomputed_score, &sort_value);
     if (!content.ok()) {
       continue;
     }
@@ -687,6 +706,7 @@ void ProcessNeighborsForReply(
     // Only assign content if it's within size limit
     if (!size_exceeded) {
       neighbor.attribute_contents = std::move(content.value());
+      neighbor.sort_value = std::move(sort_value);
     }
   }
   // Remove all entries that don't have content now.

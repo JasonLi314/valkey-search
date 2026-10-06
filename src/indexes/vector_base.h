@@ -280,6 +280,9 @@ struct Neighbor {
   // than inspecting the float, which is unreliable under -ffast-math.
   bool has_vr_distance;
   std::optional<RecordsMap> attribute_contents;
+  // The SORTBY attribute's value, resolved through the schema; null when the
+  // document lacks it (issue #1440).
+  vmsdk::UniqueValkeyString sort_value;
   Neighbor()
       : distance(0.0f),
         score(kDefaultScore),
@@ -311,7 +314,8 @@ struct Neighbor {
         score(other.score),
         sequence_number(other.sequence_number),
         has_vr_distance(other.has_vr_distance),
-        attribute_contents(std::move(other.attribute_contents)) {}
+        attribute_contents(std::move(other.attribute_contents)),
+        sort_value(std::move(other.sort_value)) {}
   Neighbor &operator=(Neighbor &&other) noexcept {
     if (this != &other) {
       external_id = std::move(other.external_id);
@@ -320,6 +324,7 @@ struct Neighbor {
       sequence_number = other.sequence_number;
       has_vr_distance = other.has_vr_distance;
       attribute_contents = std::move(other.attribute_contents);
+      sort_value = std::move(other.sort_value);
     }
     return *this;
   }

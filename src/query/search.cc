@@ -658,6 +658,76 @@ CalcBestMatchingInkeys(const SearchParameters &parameters,
   return results;
 }
 
+// The value an index holds for key, or null when it has to be read from the
+// document instead: TEXT, a JSON vector, or a key the index does not hold.
+vmsdk::UniqueValkeyString IndexedValue(const SearchParameters &parameters,
+                                       indexes::IndexBase *index,
+                                       const InternedStringPtr &key) {
+  switch (index->GetIndexerType()) {
+    case indexes::IndexerType::kTag: {
+      auto tag_index = dynamic_cast<indexes::Tag *>(index);
+      auto tag_value_ptr = tag_index->GetRawValue(key);
+      if (tag_value_ptr) {
+        return vmsdk::MakeUniqueValkeyString(*tag_value_ptr);
+      }
+      return nullptr;
+    }
+    case indexes::IndexerType::kNumeric: {
+      auto *numeric_index = dynamic_cast<indexes::Numeric *>(index);
+      const auto *numeric = numeric_index->GetValue(key);
+      if (numeric != nullptr) {
+        return vmsdk::MakeUniqueValkeyString(expr::FormatDouble(*numeric));
+      }
+      return nullptr;
+    }
+    case indexes::IndexerType::kVector:
+    case indexes::IndexerType::kHNSW:
+    case indexes::IndexerType::kFlat: {
+      const auto attribute_data_type =
+          parameters.index_schema->GetAttributeDataType().ToProto();
+      if (attribute_data_type ==
+          data_model::AttributeDataType::ATTRIBUTE_DATA_TYPE_JSON) {
+        // RediSearch materializes a JSON vector attribute from the
+        // document, so the caller gets back exactly what they stored. The
+        // index only holds a copy converted to the attribute's storage
+        // type, which for FLOAT16/BFLOAT16 is lossy -- serving it here
+        // would answer a different question than RediSearch does. Fall
+        // through to the main-thread key fetch, the same way a text
+        // attribute does.
+        return nullptr;
+      }
+      // Serving the indexed copy is only correct when it is byte-identical
+      // to what the caller stored, which holds for HASH alone: there the
+      // stored bytes are the blob the caller supplied. Assert rather than
+      // assume, so a third attribute data type cannot silently inherit the
+      // HASH path and start handing back a converted vector.
+      CHECK(attribute_data_type ==
+            data_model::AttributeDataType::ATTRIBUTE_DATA_TYPE_HASH)
+          << "Unsupported attribute data type for vector content "
+             "materialization: "
+          << static_cast<int>(attribute_data_type);
+      const auto *vector_index =
+          dynamic_cast<const indexes::VectorBase *>(index);
+      auto vector = vector_index->GetVectorDuringSearch(key);
+      if (vector.ok()) {
+        return vmsdk::UniqueValkeyString(
+            ValkeyModule_CreateString(nullptr, vector->data(), vector->size()));
+      }
+      VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 1)
+          << "Failed to get vector value during fetching through index "
+             "contents: "
+          << vector.status();
+      return nullptr;
+    }
+    case indexes::IndexerType::kText:
+      // Text indexes don't store retrievable raw values
+      return nullptr;
+    default:
+      CHECK(false) << "Unsupported indexer type: "
+                   << (int)index->GetIndexerType();
+  }
+}
+
 absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
     absl::StatusOr<std::vector<indexes::Neighbor>> results,
     const SearchParameters &parameters) {
@@ -685,6 +755,26 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
     }
     attributes.push_back(AttributeInfo{&attribute, index.value().get()});
   }
+  // A SORTBY on a stored attribute is served from its index too; the KNN
+  // distance aliases are computed, not stored. Worker thread: the gate macro's
+  // counter is main-thread only.
+  indexes::IndexBase *sortby_index = nullptr;
+  if (parameters.sortby_parameter.has_value() &&
+      options::EnabledInVersion(1, 3, 0)) {
+    const std::string &sortby_field = parameters.sortby_parameter->field;
+    const bool is_distance_alias =
+        (parameters.score_as &&
+         sortby_field == vmsdk::ToStringView(parameters.score_as.get())) ||
+        sortby_field == GetVrScoreFieldName(parameters);
+    if (!is_distance_alias) {
+      auto index = parameters.index_schema->GetIndex(sortby_field);
+      if (!index.ok() ||
+          index.value()->GetIndexerType() == indexes::IndexerType::kText) {
+        return results;
+      }
+      sortby_index = index.value().get();
+    }
+  }
   for (auto &neighbor : *results) {
     if (neighbor.attribute_contents.has_value()) {
       continue;
@@ -692,96 +782,30 @@ absl::StatusOr<std::vector<indexes::Neighbor>> MaybeAddIndexedContent(
     neighbor.attribute_contents = RecordsMap();
     bool any_value_missing = false;
     for (auto &attribute_info : attributes) {
-      vmsdk::UniqueValkeyString attribute_value = nullptr;
-      switch (attribute_info.index->GetIndexerType()) {
-        case indexes::IndexerType::kTag: {
-          auto tag_index = dynamic_cast<indexes::Tag *>(attribute_info.index);
-          auto tag_value_ptr = tag_index->GetRawValue(neighbor.external_id);
-          if (tag_value_ptr) {
-            attribute_value = vmsdk::MakeUniqueValkeyString(*tag_value_ptr);
-          }
-          break;
-        }
-        case indexes::IndexerType::kNumeric: {
-          auto *numeric_index =
-              dynamic_cast<indexes::Numeric *>(attribute_info.index);
-          const auto *numeric = numeric_index->GetValue(neighbor.external_id);
-          if (numeric != nullptr) {
-            attribute_value =
-                vmsdk::MakeUniqueValkeyString(expr::FormatDouble(*numeric));
-          }
-          break;
-        }
-        case indexes::IndexerType::kVector:
-        case indexes::IndexerType::kHNSW:
-        case indexes::IndexerType::kFlat: {
-          const auto attribute_data_type =
-              parameters.index_schema->GetAttributeDataType().ToProto();
-          if (attribute_data_type ==
-              data_model::AttributeDataType::ATTRIBUTE_DATA_TYPE_JSON) {
-            // RediSearch materializes a JSON vector attribute from the
-            // document, so the caller gets back exactly what they stored. The
-            // index only holds a copy converted to the attribute's storage
-            // type, which for FLOAT16/BFLOAT16 is lossy -- serving it here
-            // would answer a different question than RediSearch does. Fall
-            // through to the main-thread key fetch, the same way a text
-            // attribute does.
-            any_value_missing = true;
-            break;
-          }
-          // Serving the indexed copy is only correct when it is byte-identical
-          // to what the caller stored, which holds for HASH alone: there the
-          // stored bytes are the blob the caller supplied. Assert rather than
-          // assume, so a third attribute data type cannot silently inherit the
-          // HASH path and start handing back a converted vector.
-          CHECK(attribute_data_type ==
-                data_model::AttributeDataType::ATTRIBUTE_DATA_TYPE_HASH)
-              << "Unsupported attribute data type for vector content "
-                 "materialization: "
-              << static_cast<int>(attribute_data_type);
-          const auto *vector_index =
-              dynamic_cast<const indexes::VectorBase *>(attribute_info.index);
-          auto vector =
-              vector_index->GetVectorDuringSearch(neighbor.external_id);
-          if (vector.ok()) {
-            attribute_value =
-                vmsdk::UniqueValkeyString(ValkeyModule_CreateString(
-                    nullptr, vector->data(), vector->size()));
-          } else {
-            VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 1)
-                << "Failed to get vector value during fetching through index "
-                   "contents: "
-                << vector.status();
-          }
-          break;
-        }
-        case indexes::IndexerType::kText: {
-          // Text indexes don't store retrievable raw values
-          any_value_missing = true;
-          break;
-        }
-        default:
-          CHECK(false) << "Unsupported indexer type: "
-                       << (int)attribute_info.index->GetIndexerType();
-      }
-
-      if (attribute_value != nullptr) {
-        auto identifier = vmsdk::MakeUniqueValkeyString(
-            vmsdk::ToStringView(attribute_info.attribute->identifier.get()));
-        auto identifier_view = vmsdk::ToStringView(identifier.get());
-        neighbor.attribute_contents->emplace(
-            identifier_view,
-            RecordsMapValue(std::move(identifier), std::move(attribute_value)));
-      } else {
+      auto attribute_value =
+          IndexedValue(parameters, attribute_info.index, neighbor.external_id);
+      if (attribute_value == nullptr) {
         // Mark this neighbor as needing content retrieval via the main thread
         // (e.g. the attribute value may exist but not be indexed due to type
         // mismatch).
         any_value_missing = true;
         break;
       }
+      auto identifier = vmsdk::MakeUniqueValkeyString(
+          vmsdk::ToStringView(attribute_info.attribute->identifier.get()));
+      auto identifier_view = vmsdk::ToStringView(identifier.get());
+      neighbor.attribute_contents->emplace(
+          identifier_view,
+          RecordsMapValue(std::move(identifier), std::move(attribute_value)));
+    }
+    if (!any_value_missing && sortby_index != nullptr) {
+      neighbor.sort_value =
+          IndexedValue(parameters, sortby_index, neighbor.external_id);
+      any_value_missing = neighbor.sort_value == nullptr;
     }
     if (any_value_missing) {
       neighbor.attribute_contents = std::nullopt;
+      neighbor.sort_value = nullptr;
     }
   }
   return results;

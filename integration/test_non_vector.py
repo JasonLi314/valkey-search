@@ -6,6 +6,7 @@ import json
 import random
 from valkey.cluster import ValkeyCluster
 from valkey_search_test_case import ValkeySearchClusterTestCase
+import struct
 import time
 import pytest
 from utils import IndexingTestHelper
@@ -1172,6 +1173,112 @@ class TestReturnClauseGate(ValkeySearchTestCaseDebugMode):
                 "FT.SEARCH", "rcg_idx", "@m:{all}", "NOCONTENT",
                 "RETURN", "1", "title", "DIALECT", "2")
             assert result == id_only, f"emulate-release {release}"
+
+
+class TestSortByAliasGate(ValkeySearchTestCaseDebugMode):
+    """
+        SORTBY on an aliased attribute (issue #1440) is gated on
+        search.emulate-release: pre-1.3.0 the sort read the content map by
+        the typed token, so an alias that names another attribute's hash
+        field sorted by that field. debug-mode is required to set
+        emulate-release at the module version.
+    """
+
+    def test_sortby_alias_gate(self):
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "sba_idx", "ON", "HASH", "PREFIX", "1", "sba:",
+            "SCHEMA", "a", "AS", "b", "NUMERIC", "b", "AS", "c", "NUMERIC",
+            "v", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", "2",
+            "DISTANCE_METRIC", "L2") == b"OK"
+        vec = struct.pack("<2f", 0.0, 0.0)
+        for key, a, b in (("sba:1", 7, 500), ("sba:2", 5, 900),
+                          ("sba:3", 6, 100)):
+            assert client.execute_command(
+                "HSET", key, "a", a, "b", b, "v", vec) == 3
+        IndexingTestHelper.wait_for_indexing_complete_on_node(client, "sba_idx")
+
+        def legacy_uses():
+            # The INFO field appears with the first query that evaluates the gate.
+            return client.info("SEARCH").get(
+                "search_compatibility-ft_search_sortby_alias", 0)
+
+        knn = ["*=>[KNN 3 @v $q]", "PARAMS", "2", "q", vec]
+        # Legacy sorts by hash field b (100, 500, 900); fixed by attribute b
+        # (5, 6, 7), the one `SORTBY b` names.
+        for release, by_field_b, counted in (("1.2.1", True, 1),
+                                             ("1.3.0", False, 0)):
+            assert client.execute_command(
+                "CONFIG", "SET", "search.emulate-release", release) == b"OK"
+            if by_field_b:
+                with_c = [3, b"sba:3", b"#100", [b"c", b"100"],
+                          b"sba:1", b"#500", [b"c", b"500"],
+                          b"sba:2", b"#900", [b"c", b"900"]]
+                desc_ids = [3, b"sba:2", b"sba:1", b"sba:3"]
+            else:
+                with_c = [3, b"sba:2", b"#5", [b"c", b"900"],
+                          b"sba:3", b"#6", [b"c", b"100"],
+                          b"sba:1", b"#7", [b"c", b"500"]]
+                desc_ids = [3, b"sba:1", b"sba:3", b"sba:2"]
+            for query, expected in ((["@b:[0 10]"], with_c), (knn, with_c)):
+                before = legacy_uses()
+                result = client.execute_command(
+                    "FT.SEARCH", "sba_idx", *query, "SORTBY", "b", "ASC",
+                    "WITHSORTKEYS", "RETURN", "1", "c", "DIALECT", "2")
+                assert result == expected, f"emulate-release {release}"
+                assert legacy_uses() - before == counted
+            before = legacy_uses()
+            result = client.execute_command(
+                "FT.SEARCH", "sba_idx", "@b:[0 10]", "SORTBY", "b", "DESC",
+                "NOCONTENT", "DIALECT", "2")
+            assert result == desc_ids, f"emulate-release {release}"
+            assert legacy_uses() - before == counted
+
+    def test_sortby_knn_prefill_gate(self):
+        # The KNN index-served pre-fill reads SORTBY only at >= 1.3.0; below
+        # that it must produce the pre-fix bytes (unsorted, 12-digit values).
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "sbk_idx", "ON", "HASH", "PREFIX", "1", "sbk:",
+            "SCHEMA", "t", "TEXT", "n", "NUMERIC", "a", "AS", "s", "NUMERIC",
+            "v", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", "2",
+            "DISTANCE_METRIC", "L2") == b"OK"
+        vec = struct.pack("<2f", 0.0, 0.0)
+        docs = (("sbk:1", "charlie", "0.1234567890123456", 7, 1.0),
+                ("sbk:2", "alpha", "0.2234567890123456", 5, 2.0),
+                ("sbk:3", "bravo", "0.3234567890123456", 6, 3.0))
+        for key, t, n, a, x in docs:
+            assert client.execute_command(
+                "HSET", key, "t", t, "n", n, "a", a, "v",
+                struct.pack("<2f", x, 0.0)) == 4
+        # sbk:4 lacks the aliased sort field a.
+        assert client.execute_command(
+            "HSET", "sbk:4", "t", "delta", "n", "0.4234567890123456", "v",
+            struct.pack("<2f", 4.0, 0.0)) == 3
+        IndexingTestHelper.wait_for_indexing_complete_on_node(client, "sbk_idx")
+        knn = ["*=>[KNN 4 @v $q]", "PARAMS", "2", "q", vec]
+        legacy = [4, b"sbk:1", b"#", [b"n", b"0.123456789012"],
+                  b"sbk:2", b"#", [b"n", b"0.223456789012"],
+                  b"sbk:3", b"#", [b"n", b"0.323456789012"],
+                  b"sbk:4", b"#", [b"n", b"0.423456789012"]]
+        by_text = [4, b"sbk:2", b"$alpha", [b"n", b"0.2234567890123456"],
+                   b"sbk:3", b"$bravo", [b"n", b"0.3234567890123456"],
+                   b"sbk:1", b"$charlie", [b"n", b"0.1234567890123456"],
+                   b"sbk:4", b"$delta", [b"n", b"0.4234567890123456"]]
+        by_alias = [4, b"sbk:2", b"#5", [b"n", b"0.223456789012"],
+                    b"sbk:3", b"#6", [b"n", b"0.323456789012"],
+                    b"sbk:1", b"#7", [b"n", b"0.123456789012"],
+                    b"sbk:4", None, [b"n", b"0.4234567890123456"]]
+        for release, text_expected, alias_expected in (
+                ("1.2.1", legacy, legacy), ("1.3.0", by_text, by_alias)):
+            assert client.execute_command(
+                "CONFIG", "SET", "search.emulate-release", release) == b"OK"
+            for field, expected in (("t", text_expected),
+                                    ("s", alias_expected)):
+                result = client.execute_command(
+                    "FT.SEARCH", "sbk_idx", *knn, "SORTBY", field, "ASC",
+                    "WITHSORTKEYS", "RETURN", "1", "n", "DIALECT", "2")
+                assert result == expected, f"emulate-release {release} {field}"
 
 
 class TestAggregateReducerAlias(ValkeySearchTestCaseDebugMode):

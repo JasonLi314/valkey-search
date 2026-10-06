@@ -172,6 +172,16 @@ struct SearchPartitionResultsTracker {
           std::bit_cast<uint32_t>(neighbor_entry->distance()) !=
           std::bit_cast<uint32_t>(indexes::scoring::PositiveInf());
       neighbor.score = neighbor_entry->score();
+      // The wire carries no sort slot; take the entry under the SORTBY token,
+      // which is where the shard put the sort value (issue #1440).
+      if (parameters->sortby_parameter.has_value()) {
+        auto itr = neighbor.attribute_contents->find(
+            parameters->sortby_parameter->field);
+        if (itr != neighbor.attribute_contents->end()) {
+          neighbor.sort_value = vmsdk::MakeUniqueValkeyString(
+              vmsdk::ToStringView(itr->second.value.get()));
+        }
+      }
       AddResult(neighbor);
     }
   }

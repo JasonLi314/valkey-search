@@ -40,9 +40,23 @@ struct SearchCommand : public QueryCommand {
 
   query::SerializationRange GetSerializationRange() const;
 
+  // Settings shared by every row of a reply.
+  struct RowFormat {
+    bool has_relevance{false};
+    bool sort_by_vec_score{false};
+    bool nil_absent_sort_key{false};
+    // Sort value read from Neighbor::sort_value rather than the content map.
+    bool sort_from_slot{false};
+    std::string sort_key_prefix;
+    // The single VR distance field name (query::GetVrScoreFieldName).
+    // Empty unless the query named the distance ($yield_distance_as or AS).
+    std::string vr_field;
+  };
+  RowFormat GetRowFormat() const;
+
   // Replies one array per document in search_result.neighbors[start, end).
   void ReplyRows(ValkeyModuleCtx *ctx, const query::SearchResult &search_result,
-                 size_t start, size_t end) const;
+                 size_t start, size_t end, const RowFormat &format) const;
 
   bool with_sort_keys{false};
   bool with_scores{false};
@@ -60,17 +74,6 @@ struct SearchCommand : public QueryCommand {
   }
 
  private:
-  // Settings shared by every row of a reply.
-  struct RowFormat {
-    bool has_relevance{false};
-    bool sort_by_vec_score{false};
-    bool nil_absent_sort_key{false};
-    std::string sort_key_prefix;
-    // The single VR distance field name (query::GetVrScoreFieldName).
-    // Empty unless the query named the distance ($yield_distance_as or AS).
-    std::string vr_field;
-  };
-  RowFormat GetRowFormat() const;
   // Replies a document's elements: key, [score], [sort key], fields. Returns
   // the number of elements replied.
   size_t ReplyRowElements(ValkeyModuleCtx *ctx,
