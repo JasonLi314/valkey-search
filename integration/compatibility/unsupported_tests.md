@@ -15,7 +15,8 @@ Two markers are used, and they mean different things:
   been closed, and both the marker and the entry here should be removed.
 
 Sections 1-4 cover the text-search suite (`generate_text.py`); section 5 covers
-the FT.HYBRID suite (`generate_hybrid.py`).
+the FT.HYBRID suite (`generate_hybrid.py`); section 6 covers FT.SEARCH
+`WITHSORTKEYS` (`generate.py`).
 
 ## 1. Exact Phrase Query
 
@@ -678,3 +679,27 @@ computation, or to capture a second set of reference answers from a Redis
 cluster. Until one of those happens, flipping the flag would record the
 divergence 169 times rather than test anything. Note the reference engine's own
 cluster behaviour is unmeasured here: this generator runs one container.
+
+## 6. FT.SEARCH WITHSORTKEYS
+
+### 6.1. Non-SORTABLE NUMERIC sort key in a hash full-content reply — marked `xfail`
+
+**Status:** open.
+
+Redis prefixes the sort key of a NUMERIC field declared without `SORTABLE`
+with `$` when the reply carries the full document, and with `#` otherwise.
+valkey-search prefixes a NUMERIC sort key with `#` in every reply shape.
+Measured on `redis:latest` with `SCHEMA m TAG n NUMERIC s NUMERIC SORTABLE`:
+
+```
+FT.SEARCH idx @m:{all} SORTBY n ASC WITHSORTKEYS                 Redis $1   valkey #1
+FT.SEARCH idx @m:{all} SORTBY n ASC WITHSORTKEYS RETURN 1 m      Redis #1   valkey #1
+FT.SEARCH idx @m:{all} SORTBY s ASC WITHSORTKEYS                 Redis #1   valkey #1
+FT.SEARCH idx * SORTBY n ASC WITHSCORES WITHSORTKEYS             Redis $1   valkey #1
+```
+
+Only the prefix byte differs; the digits and the row order match. The `sortable
+numbers` schema declares `n1`/`n2` without `SORTABLE`, so every hash
+`WITHSORTKEYS` case without a `RETURN` clause in `test_search_sortby` and
+`test_vector_range_withsortkeys` hits this and is marked `xfail`. The same
+cases with `RETURN`, and every JSON case, compare and match.

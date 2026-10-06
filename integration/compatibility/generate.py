@@ -230,7 +230,8 @@ class BaseCompatibilityTest:
         self.vector_data_type = vector_data_type
         return load_data(self.client, data_set_name, key_type, vector_data_type=vector_data_type)
 
-    def execute_command(self, cmd, excluded=False, excluded_cluster_only=False):
+    def execute_command(self, cmd, excluded=False, excluded_cluster_only=False,
+                        xfail=False):
         answer = {"cmd": cmd,
                   "key_type": self.key_type,
                   "data_set_name": self.data_set_name,
@@ -260,6 +261,11 @@ class BaseCompatibilityTest:
             print(f"Got exception for Error: '{exc}', Cmd:{cmd}")
             answer["result"] = {}
             answer["exception"] = True
+        if xfail and not answer["exception"] and len(answer["result"]) > 1:
+            # Open gap: compared, mismatch expected, XPASS reported once it
+            # matches (see unsupported_tests.md). A reply with no rows has
+            # nothing to diverge on, so it is compared normally.
+            answer["xfail"] = True
         self.answers.append(answer)
 
     def check(self, *orig_cmd):
@@ -276,7 +282,7 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
     def checkrange(self, dialect, *orig_cmd, radius=1.0,
                    query_vector=[0] * VECTOR_DIM, field="v1",
                    extra_params="", query_attrs=None, negate=False,
-                   excluded=False):
+                   excluded=False, xfail=False):
         """Build and execute a VECTOR_RANGE query.
 
         The first ``*`` in *orig_cmd* is replaced with the range clause.
@@ -305,7 +311,8 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
             "RADIUS", str(radius),
             "DIALECT", str(dialect),
         ]
-        self.execute_command(_join_search_query(new_cmd), excluded=excluded)
+        self.execute_command(_join_search_query(new_cmd), excluded=excluded,
+                             xfail=xfail)
 
     def checkvec(self, dialect, *orig_cmd, knn=10000, score_as="", query_vector=[0] * VECTOR_DIM):
         '''Check vector queries only.'''
@@ -347,7 +354,7 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
             str(dialect),
         ]
         self.execute_command(_join_search_query(new_cmd))
-    def check(self, dialect, *orig_cmd, excluded=False):
+    def check(self, dialect, *orig_cmd, excluded=False, xfail=False):
         '''Check Non-vector queries. Doesn't have support for '*' yet. '''
         cmd = orig_cmd[0].split() if len(orig_cmd) == 1 else [*orig_cmd]
         for query in ["@n1:[-inf inf]", "@t1:{aaaaaaa*}", "-@n1:[-inf inf]", "-@t1:{aaaaaa*}"]:
@@ -364,7 +371,8 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
                 "DIALECT",
                 str(dialect),
             ]
-            self.execute_command(_join_search_query(new_cmd), excluded=excluded)
+            self.execute_command(_join_search_query(new_cmd), excluded=excluded,
+                                 xfail=xfail)
 
     def checkall(self, dialect, *orig_cmd, **kwargs):
         '''Non-vector commands. Doesn't have support for '*' yet. '''
@@ -1165,7 +1173,23 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
                 for return_keys in ["", "RETURN 2 @n1 @t1"]:
                     for wsk in ["", "WITHSORTKEYS"]:
                         for limit in ["LIMIT 0 5", "LIMIT 2 3", ""]:
-                            self.check(dialect, f"ft.search {key_type}_idx1 * SORTBY {sort_key} {direction} {return_keys} {limit} {wsk}")
+                            # xfail: Redis prefixes a non-SORTABLE NUMERIC sort
+                            # key with `$` in a hash full-content reply
+                            # (unsupported_tests.md 6.1).
+                            xfail = key_type == "hash" and wsk != "" and return_keys == ""
+                            self.check(dialect, f"ft.search {key_type}_idx1 * SORTBY {sort_key} {direction} {return_keys} {limit} {wsk}",
+                                       xfail=xfail)
+
+        # WITHSCORES WITHSORTKEYS (stride-4 reply). Numeric query only: Redis
+        # scores a TAG match `nan`, valkey-search `0`.
+        for return_keys in ["", "RETURN 2 @n1 @t1"]:
+            # LIMIT 100 5 returns the count and no rows.
+            for limit in ["LIMIT 0 5", "LIMIT 100 5"]:
+                # Same `$` prefix gap as above.
+                xfail = key_type == "hash" and return_keys == ""
+                self.execute_command(_join_search_query(
+                    f"ft.search {key_type}_idx1 @n1:[-inf inf] SORTBY n1 ASC WITHSCORES WITHSORTKEYS {return_keys} {limit} DIALECT {dialect}".split()),
+                    xfail=xfail)
 
     @pytest.mark.parametrize("algo", ["flat", "hnsw"])
     @pytest.mark.parametrize("metric", ["l2", "ip", "cosine"])
@@ -1445,15 +1469,17 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
     def test_vector_range_withsortkeys(self, key_type, dialect, vector_data_type):
         """VECTOR_RANGE with WITHSORTKEYS captures sort key format."""
         self.setup_data("sortable numbers", key_type)
+        # xfail: same `$` prefix gap as test_search_sortby (unsupported_tests.md 6.1).
+        xfail = key_type == "hash"
         self.checkrange(
             dialect,
             f"ft.search {key_type}_idx1 * SORTBY n1 ASC WITHSORTKEYS",
-            radius=50,
+            radius=50, xfail=xfail,
         )
         self.checkrange(
             dialect,
             f"ft.search {key_type}_idx1 * SORTBY n1 DESC WITHSORTKEYS",
-            radius=50,
+            radius=50, xfail=xfail,
         )
 
     def test_vector_range_return_without_score(self, key_type, dialect, vector_data_type):

@@ -149,23 +149,27 @@ def parse_value(x, key_type):
         raise
     return result
 
-def result_has_sortkeys(rs):
+def result_has_sortkeys(rs, has_scores=False):
     """Detect if a search result actually contains sort keys by checking the format.
     
     With sort keys: [count, key1, #sortkey1, [fields1], key2, #sortkey2, [fields2], ...]
     Without sort keys: [count, key1, [fields1], key2, [fields2], ...]
+    With WITHSCORES the score sits between the key and the sort key.
     
     The sort key is a bytes/string that starts with '#' (or '$' in some Redis versions),
-    and fields are always a list.
+    or a RESP nil when the document lacks the SORTBY field, and fields are always a list.
     """
-    if len(rs) < 3:
+    # Index of the first row's sort-key slot (after count, key and any score).
+    idx = 3 if has_scores else 2
+    if len(rs) <= idx:
         return False
-    # Check if element at index 2 (after count and first key) is a sort key (starts with # or $)
-    # or a fields list
-    second_elem = rs[2]
+    # Check if that element is a sort key (starts with # or $, or nil) or a fields list
+    second_elem = rs[idx]
     if isinstance(second_elem, list):
         # It's a fields list, so no sort keys
         return False
+    if second_elem is None:
+        return True
     if isinstance(second_elem, (bytes, str)):
         # Check if it starts with '#' or '$' (sort key indicator)
         if isinstance(second_elem, bytes):
@@ -191,8 +195,8 @@ def unpack_search_result(rs, key_type, has_sortkeys=False, nocontent=False,
         # WITHSCORES + WITHSORTKEYS:
         # [count, key1, score1, sortkey1, [fields1], ...] -- stride 4.
         for i in range(1, len(rs), 4):
-            key, score, value = rs[i], rs[i+1], rs[i+3]
-            row = {"__key": key, "__score": score}
+            key, score, sortkey, value = rs[i], rs[i+1], rs[i+2], rs[i+3]
+            row = {"__key": key, "__score": score, "__sortkey": sortkey}
             for j in range(0, len(value), 2):
                 row[parse_field(value[j], key_type)] = parse_value(value[j+1], key_type)
             rows += [row]
@@ -208,9 +212,10 @@ def unpack_search_result(rs, key_type, has_sortkeys=False, nocontent=False,
             rows += [row]
     elif has_sortkeys:
         # Format: [count, key1, sortkey1, [fields1], key2, sortkey2, [fields2], ...]
-        # Step by 3 elements at a time
+        # Step by 3 elements at a time. The sort key is compared byte-for-byte
+        # as __sortkey: its prefix and formatting are part of the reply.
         for (key, sortkey, value) in [(rs[i], rs[i+1], rs[i+2]) for i in range(1, len(rs), 3)]:
-            row = {"__key": key}
+            row = {"__key": key, "__sortkey": sortkey}
             for j in range(0, len(value), 2):
                 row[parse_field(value[j], key_type)] = parse_value(value[j+1], key_type)
             rows += [row]
@@ -353,17 +358,17 @@ def unpack_result(cmd, key_type, rs, sortkeys, ordered=False):
         # not just whether WITHSORTKEYS is in the command. This handles cases
         # where the expected result (from pickle) may not have sort keys even
         # if the command requested them.
-        has_sortkeys = result_has_sortkeys(rs)
         # A keys-only reply (NOCONTENT or RETURN 0) is decided by the command,
         # not inferred from the reply shape: the reply is [count, key1, key2,
         # ...] with no field arrays, which the field-bearing path below would
         # misread as key/fields pairs.
         nocontent = _search_returns_no_fields(cmd)
         # WITHSCORES inserts a relevance score after each key. It is not a #/$
-        # sort key, so result_has_sortkeys can't see it; drive it from the cmd.
+        # sort key, so drive it from the cmd and look past it for the sort key.
         has_scores = any(
             isinstance(c, str) and c.lower() == "withscores" for c in cmd
         )
+        has_sortkeys = result_has_sortkeys(rs, has_scores)
         out = unpack_search_result(rs, key_type, has_sortkeys, nocontent,
                                    has_scores)
     else:
@@ -746,6 +751,45 @@ def mark_as_xpassed(testname):
     correct_answers += 1
     xpassed_tests[testname] = xpassed_tests.get(testname, 0) + 1
 
+def record_answer(expected, matched):
+    """Count one compared answer, honoring its `xfail` marker.
+
+    An `xfail` answer is compared like any other, but a mismatch is the
+    documented state of an open gap rather than a regression. See
+    integration/compatibility/unsupported_tests.md for what each one covers.
+    """
+    if expected.get('xfail', False):
+        (mark_as_xpassed if matched else mark_as_xfailed)(expected['testname'])
+    else:
+        (mark_as_passed if matched else mark_as_failed)(expected['testname'])
+
+def reset_counters():
+    global correct_answers, wrong_answers, failed_tests, passed_tests
+    global xfailed_tests, xpassed_tests
+    correct_answers = 0
+    wrong_answers = 0
+    failed_tests = {}
+    passed_tests = {}
+    xfailed_tests = {}
+    xpassed_tests = {}
+
+def report_xfail_summary():
+    if xfailed_tests:
+        print(">>>>>>>>> Expected Failures (known gaps) <<<<<<<<<")
+        for k, v in sorted(xfailed_tests.items()):
+            print(f"xfail {k:60}: {v} times")
+    if xpassed_tests:
+        # Not a failure: closing the gap should not break the build before
+        # someone removes the marker. It does need to be impossible to miss.
+        print("!" * 78)
+        print("XPASS: answers marked `xfail` in the generator now MATCH.")
+        print("The gap they document has been closed -- drop the xfail")
+        print("marker in integration/compatibility/ and update")
+        print("unsupported_tests.md.")
+        for k, v in sorted(xpassed_tests.items()):
+            print(f"  xpass {k:60}: {v} times")
+        print("!" * 78)
+
 def do_answer(client, expected, data_set):
     global correct_answers, failed_tests, passed_tests
     next_data_set = (expected['data_set_name'], expected['key_type'],
@@ -780,18 +824,8 @@ def do_answer(client, expected, data_set):
         except Exception as e:
             print(f"⚠ Failed to set Valkey compat mode for test: {expected['testname']}, error: {e}")
     
-    # An `xfail` answer is compared like any other, but a mismatch is the
-    # documented state of an open gap rather than a regression. See
-    # integration/compatibility/unsupported_tests.md for what each one covers.
-    xfail = expected.get('xfail', False)
-    if xfail:
+    if expected.get('xfail', False):
         print(f"xfail answer (known gap): {expected['cmd']}")
-
-    def record(matched):
-        if xfail:
-            (mark_as_xpassed if matched else mark_as_xfailed)(expected['testname'])
-        else:
-            (mark_as_passed if matched else mark_as_failed)(expected['testname'])
 
     result = {}
     try:
@@ -799,11 +833,11 @@ def do_answer(client, expected, data_set):
         result["cmd"] = expected['cmd']
         result["result"] = client.execute_command(*expected['cmd'])
         result["exception"] = False
-        record(compare_results(expected, result))
+        record_answer(expected, compare_results(expected, result))
     except valkey.ResponseError as e:
         print(f"Got ResponseError: {e} for command {expected['cmd']}")
         result["exception"] = True
-        record(compare_results(expected, result))
+        record_answer(expected, compare_results(expected, result))
     return data_set
 
 def cluster_routing(cmd):
@@ -883,6 +917,9 @@ def do_answer_cluster(cluster_client, expected, data_set, test_case):
             print(f"Excluded CLUSTER query raised: {e} for cmd {expected['cmd']}")
         return data_set
 
+    if expected.get('xfail', False):
+        print(f"xfail answer (known gap): {expected['cmd']}")
+
     result = {}
     try:
         print(
@@ -894,20 +931,12 @@ def do_answer_cluster(cluster_client, expected, data_set, test_case):
         result["result"] = cluster_client.execute_command(
             *expected["cmd"], **cluster_routing(expected["cmd"]))
         result["exception"] = False
-
-        if compare_results(expected, result):
-            mark_as_passed(expected["testname"])
-        else:
-            mark_as_failed(expected["testname"])
+        record_answer(expected, compare_results(expected, result))
 
     except valkey.ResponseError as e:
         print(f"Got ResponseError: {e} for command {expected['cmd']}")
         result["exception"] = True
-
-        if compare_results(expected, result):
-            mark_as_passed(expected["testname"])
-        else:
-            mark_as_failed(expected["testname"])
+        record_answer(expected, compare_results(expected, result))
 
     return data_set
 
@@ -961,16 +990,8 @@ class TestAnswersCMD(ValkeySearchTestCaseDebugMode):
     @pytest.mark.parametrize("answers", ALL_ANSWER_FILES)
     def test_answers(self, answers):
         global client, data_set
-        global correct_answers, failed_tests, passed_tests
-        global xfailed_tests, xpassed_tests
 
-        # RESET GLOBAL COUNTERS AT START OF EACH TEST
-        correct_answers = 0
-        wrong_answers = 0
-        failed_tests = {}
-        passed_tests = {}
-        xfailed_tests = {}
-        xpassed_tests = {}
+        reset_counters()
 
         print("Running test_answers with answers file:", answers)
         answers = _load_answers_with_hash_check(answers)
@@ -983,21 +1004,7 @@ class TestAnswersCMD(ValkeySearchTestCaseDebugMode):
         for i in range(len(answers)):
             data_set = do_answer(client, answers[i], data_set)
 
-        if xfailed_tests:
-            print(">>>>>>>>> Expected Failures (known gaps) <<<<<<<<<")
-            for k, v in sorted(xfailed_tests.items()):
-                print(f"xfail {k:60}: {v} times")
-        if xpassed_tests:
-            # Not a failure: closing the gap should not break the build before
-            # someone removes the marker. It does need to be impossible to miss.
-            print("!" * 78)
-            print("XPASS: answers marked `xfail` in the generator now MATCH.")
-            print("The gap they document has been closed -- drop the xfail")
-            print("marker in integration/compatibility/ and update")
-            print("unsupported_tests.md.")
-            for k, v in sorted(xpassed_tests.items()):
-                print(f"  xpass {k:60}: {v} times")
-            print("!" * 78)
+        report_xfail_summary()
 
         expected_count = sum(1 for a in answers if not a.get('excluded'))
         if correct_answers != expected_count:
@@ -1041,12 +1048,7 @@ class TestAnswersCMD(ValkeySearchTestCaseDebugMode):
 class TestAnswersCME(ValkeySearchClusterTestCaseDebugMode):
     @pytest.mark.parametrize("answers", CLUSTER_ANSWER_FILES)
     def test_answers(self, answers):
-        global correct_answers, wrong_answers, failed_tests, passed_tests
-
-        correct_answers = 0
-        wrong_answers = 0
-        failed_tests = {}
-        passed_tests = {}
+        reset_counters()
 
         print("Running CLUSTER test_answers with answers file:", answers)
 
@@ -1077,6 +1079,8 @@ class TestAnswersCME(ValkeySearchClusterTestCaseDebugMode):
                 data_set=data_set,
                 test_case=self,
             )
+
+        report_xfail_summary()
 
         expected_count = sum(
             1 for a in answers
