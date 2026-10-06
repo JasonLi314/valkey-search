@@ -491,6 +491,8 @@ function check_and_clean_on_branch_change() {
     if [ -d "${BUILD_DIR}" ] && [ -f "${branch_stamp}" ] && [ "$(cat "${branch_stamp}")" != "${current_branch}" ]; then
         printf "${BOLD_PINK}Notice: Branch changed from $(cat "${branch_stamp}") to ${current_branch}. Cleaning stale protobuf artifacts...${RESET}\n"
         rm -f "${BUILD_DIR}"/src/*.pb.* 2>/dev/null || true
+        # protoc runs at configure time, so the deleted files only come back with a reconfigure.
+        RUN_CMAKE="yes"
     fi
     mkdir -p "${BUILD_DIR}"
     echo "${current_branch}" > "${branch_stamp}"
