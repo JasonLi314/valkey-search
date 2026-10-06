@@ -1,5 +1,8 @@
-import hashlib
+import gzip
 import os
+import pickle
+
+from .sources import compute_sources_hash
 
 _COMPAT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -28,25 +31,17 @@ GENERATORS = [
 ]
 
 
-def compute_sources_hash():
-    """SHA256 of every .py file under this directory, recursively.
-
-    Stored inside the generated pickle answer files so compatibility_test.py
-    can detect when a pickle is stale relative to the generators and helpers.
-    Recursive so generators in per-command subdirectories (e.g. search/) are
-    covered by the staleness check.
-    """
-    h = hashlib.sha256()
-    for dirpath, dirnames, filenames in os.walk(_COMPAT_DIR):
-        dirnames.sort()
-        for fname in sorted(filenames):
-            if not fname.endswith(".py"):
-                continue
-            path = os.path.join(dirpath, fname)
-            rel = os.path.relpath(path, _COMPAT_DIR).replace(os.sep, "/")
-            h.update(rel.encode("utf-8"))
-            h.update(b"\0")
-            with open(path, "rb") as f:
-                h.update(f.read())
-            h.update(b"\0")
-    return h.hexdigest()
+def stale_generators():
+    """Generators whose pickle is missing or was built from different sources."""
+    stale = []
+    for g in GENERATORS:
+        path = os.path.join(_COMPAT_DIR, g["answers"])
+        stored = None
+        if os.path.exists(path):
+            with gzip.open(path, "rb") as f:
+                payload = pickle.load(f)
+            if isinstance(payload, dict):
+                stored = payload.get("sources_hash")
+        if stored != compute_sources_hash(g["generator"]):
+            stale.append(g["generator"])
+    return stale

@@ -37,7 +37,7 @@ import struct
 import pytest
 
 from .data_sets import HYBRID_VECTOR_DIM
-from .generate import BaseCompatibilityTest
+from .base import BaseCompatibilityTest
 
 # Query vectors, chosen against the `hybrid text` ramp (doc i sits at
 # (1 + i/4, i/2, 0, 0)): NEAR sits on top of doc 0, MID lands among the middle

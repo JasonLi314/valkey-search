@@ -3,7 +3,7 @@
 import pytest
 import re
 
-from .generate import BaseCompatibilityTest
+from .base import BaseCompatibilityTest
 
 # Compatibility answers for ARRAY values used as *input* to a later stage.
 #

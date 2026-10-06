@@ -1,7 +1,7 @@
 # Never use time.sleep() to wait for indexing: writes are searchable
 # immediately (see README).
 import pytest
-from .generate import BaseCompatibilityTest
+from .base import BaseCompatibilityTest
 
 # Operand-value set V used per slot for every operator/function sweep.
 # Each is the *literal string* that will appear in the APPLY expression.

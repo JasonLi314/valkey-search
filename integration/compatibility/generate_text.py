@@ -6,7 +6,7 @@ import re
 import os
 from . import data_sets
 from .data_sets import load_data
-from .generate import BaseCompatibilityTest, format_stack_cached
+from .base import BaseCompatibilityTest, format_stack_cached
 from .text_query_builder import *
 
 # exclude some edge cases with known Redis bugs

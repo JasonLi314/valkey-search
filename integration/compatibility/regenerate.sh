@@ -7,7 +7,10 @@
 # to capture reference answers.
 #
 # Usage:
-#   ./integration/compatibility/regenerate.sh [extra pytest args...]
+#   ./integration/compatibility/regenerate.sh [--stale-only] [extra pytest args...]
+#
+# --stale-only regenerates only the pickles whose sources changed, so the
+# others keep their bytes and do not show up in the commit.
 #
 # After it finishes, git add and commit the updated *.pickle.gz files.
 
@@ -37,21 +40,35 @@ PYTHON=${PYTHON:-python3}
 echo "Using python: ${PYTHON}"
 cd "${ROOT_DIR}"
 
+STALE_ONLY=0
+PYTEST_ARGS=()
+for arg in "$@"; do
+    if [ "${arg}" = "--stale-only" ]; then
+        STALE_ONLY=1
+    else
+        PYTEST_ARGS+=("${arg}")
+    fi
+done
+
 # Source the generator list from compatibility/__init__.py so adding a new
 # generator only requires editing one place.
+SELECTED=$(PYTHONPATH=integration "${PYTHON}" -c \
+    "from compatibility import GENERATORS, stale_generators
+stale = stale_generators() if ${STALE_ONLY} else None
+for g in GENERATORS:
+    if stale is None or g['generator'] in stale: print(g['generator'], g['answers'])")
 GENERATOR_FILES=()
-while IFS= read -r line; do
-    GENERATOR_FILES+=("${line}")
-done < <(PYTHONPATH=integration "${PYTHON}" -c \
-    "from compatibility import GENERATORS
-for g in GENERATORS: print(g['generator'])")
-
 ANSWER_FILES=()
-while IFS= read -r line; do
-    ANSWER_FILES+=("${line}")
-done < <(PYTHONPATH=integration "${PYTHON}" -c \
-    "from compatibility import GENERATORS
-for g in GENERATORS: print(g['answers'])")
+while read -r generator answers; do
+    [ -n "${generator}" ] || continue
+    GENERATOR_FILES+=("${generator}")
+    ANSWER_FILES+=("${answers}")
+done <<< "${SELECTED}"
+
+if [ "${#GENERATOR_FILES[@]}" -eq 0 ]; then
+    echo "Every pickle matches its sources; nothing to regenerate."
+    exit 0
+fi
 
 cd "${COMPAT_DIR}"
 # Each generator collects its answers in one class and writes them in
@@ -66,7 +83,7 @@ fi
 echo "==> Running ${GENERATOR_FILES[*]}"
 # The default fd capture writes each print() unbuffered to a temp file;
 # sys capture keeps the same per-test output in memory.
-"${PYTHON}" -m pytest "${XDIST_ARGS[@]}" --capture=sys "${GENERATOR_FILES[@]}" "$@"
+"${PYTHON}" -m pytest "${XDIST_ARGS[@]}" --capture=sys "${GENERATOR_FILES[@]}" "${PYTEST_ARGS[@]}"
 
 echo
 echo "Done. Updated files:"

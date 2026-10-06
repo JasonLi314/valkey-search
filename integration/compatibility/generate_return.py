@@ -3,7 +3,7 @@
 import pytest
 
 from .data_sets import RETURN_CLAUSE_DATA_SET
-from .generate import BaseCompatibilityTest
+from .base import BaseCompatibilityTest
 
 '''
 Capture RediSearch answers for repeated RETURN clauses (issue #1353 item 7):

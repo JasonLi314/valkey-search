@@ -6,7 +6,8 @@ from itertools import chain, combinations
 import pickle
 import compatibility
 from valkey.cluster import ValkeyCluster
-from compatibility import GENERATORS, compute_sources_hash
+from compatibility import GENERATORS
+from compatibility.sources import compute_sources_hash, sources_for
 from compatibility.data_sets import *
 
 ALL_ANSWER_FILES = [g["answers"] for g in GENERATORS]
@@ -937,17 +938,20 @@ def _load_answers_with_hash_check(answer_file_name):
         print(f"SKIP_COMPATIBILITY_HASH_CHECK=1; skipping hash check for {answer_file_name}")
         return answers
 
-    current_hash = compute_sources_hash()
+    generator = next(
+        g["generator"] for g in GENERATORS if g["answers"] == answer_file_name
+    )
+    current_hash = compute_sources_hash(generator)
     if stored_hash != current_hash:
         pytest.fail(
             f"\nCompatibility pickle file '{answer_file_name}' is stale.\n"
             f"  Stored hash:  {stored_hash}\n"
             f"  Current hash: {current_hash}\n"
             f"\n"
-            f"Python sources in integration/compatibility/ have changed since\n"
+            f"One of {', '.join(sources_for(generator))} has changed since\n"
             f"the pickle was generated. Regenerate with:\n"
             f"\n"
-            f"  ./integration/compatibility/regenerate.sh\n"
+            f"  ./integration/compatibility/regenerate.sh --stale-only\n"
             f"\n"
             f"Then commit the updated pickle file. To bypass this check (e.g.\n"
             f"when manually generating a small pickle for local testing), set\n"
@@ -955,6 +959,34 @@ def _load_answers_with_hash_check(answer_file_name):
             pytrace=False,
         )
     return answers
+
+
+def test_sources_closure_of_registered_generators():
+    for g in GENERATORS:
+        closure = sources_for(g["generator"])
+        assert {g["generator"], "base.py", "data_sets.py"} <= set(closure)
+        assert "__init__.py" not in closure
+    assert "text_query_builder.py" in sources_for("generate_text.py")
+
+
+def test_sources_closure_follows_every_import_style(tmp_path):
+    pkg = tmp_path / "compatibility"
+    pkg.mkdir()
+    files = {
+        "__init__.py": "",
+        "gen.py": "from .rel import A\nimport compatibility.abs_mod\n"
+                  "from compatibility.abs_from import B\nimport os\n",
+        "rel.py": "def f():\n    from . import nested\n",
+        "nested.py": "",
+        "abs_mod.py": "",
+        "abs_from.py": "from compatibility import deep\n",
+        "deep.py": "",
+        "unused.py": "",
+    }
+    for name, body in files.items():
+        (pkg / name).write_text(body)
+    closure = sources_for("gen.py", compat_dir=str(pkg))
+    assert closure == ["abs_from.py", "abs_mod.py", "deep.py", "gen.py", "nested.py", "rel.py"]
 
 
 class TestAnswersCMD(ValkeySearchTestCaseDebugMode):

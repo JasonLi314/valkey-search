@@ -30,13 +30,16 @@ it. See "Search visibility after writes" in the Redis docs:
 A generator that fails part way leaves its answer file untouched rather than
 replacing it with a short one.
 
-Each pickle stores a SHA256 of every .py file in this directory. The
-compatibility integration test (integration/compatibility_test.py) verifies
-that hash on load and fails if it does not match the current sources -- this
-forces a regeneration whenever any source here is edited -- a generator,
-data_sets.py, text_query_builder.py, or __init__.py itself. Because the hash
-covers the whole directory, editing any one of them invalidates *all* the
-pickles, so regenerate.sh regenerates all of them.
+Each pickle stores a SHA256 of its generator and of every module in this
+directory the generator imports, directly or transitively (sources.py walks
+the imports). The compatibility integration test
+(integration/compatibility_test.py) verifies that hash on load and fails if it
+does not match the current sources. Editing a generator therefore invalidates
+only its own pickle; editing a shared module -- base.py, data_sets.py,
+text_query_builder.py, sources.py -- invalidates every pickle whose generator
+imports it. No generator imports __init__.py, so registering a new generator
+leaves the existing pickles valid. `regenerate.sh --stale-only` regenerates
+just the invalidated pickles; without the flag it regenerates all of them.
 
 Not every generated command is compared. A generator can record an answer as
 `excluded` (run against Valkey as a no-crash check only, nothing compared) or

@@ -3,7 +3,7 @@
 import pytest
 
 from .data_sets import SORTKEY_NIL_DATA_SET, SORTKEY_PREFIX_DATA_SET
-from .generate import BaseCompatibilityTest
+from .base import BaseCompatibilityTest
 
 '''
 Capture RediSearch answers for the WITHSORTKEYS sort-key prefix rule
