@@ -14,6 +14,7 @@ Some metrics are reported only when they apply. The `coordinator_*` metrics appe
 | Metric Name                                                    |     Section      |     Unit     | Description                                                                                                                                                                       |
 | :------------------------------------------------------------- | :--------------: | :----------: | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | compatibility-invalid_data_drops_key                           |  compatibility   |    Count     | Count of key mutations with malformed indexed data that kept the key indexed (field treated as missing) because `search.emulate-release` is below 1.3.0 (see below)               |
+| compatibility-numeric_strict_parse                             |  compatibility   |    Count     | Count of `NUMERIC` values Redisearch rejects (NaN, surrounding whitespace, parser over/underflow) that were indexed because `search.emulate-release` is below 1.3.0 (see below)   |
 | coordinator_bytes_in                                           |   coordinator    |    Bytes     | Total size (in bytes) of incoming gRPC response messages received by the coordinator client from remote nodes                                                                     |
 | coordinator_bytes_out                                          |   coordinator    |    Bytes     | Total size (in bytes) of outgoing gRPC request messages sent by the coordinator client to remote nodes                                                                            |
 | coordinator_client_get_global_metadata_failure_count           |   coordinator    |    Count     | Count of failed client requests to get global metadata                                                                                                                            |
@@ -82,5 +83,5 @@ Some metrics are reported only when they apply. The `coordinator_*` metrics appe
 
 Each `compatibility-*` metric counts how often a legacy, incompatible behavior was used because `search.emulate-release` is set below
 the release that fixed it. See [Compatibility Defects](../../COMPATIBILITY.md#compatibility-defects) for the full list and what each one
-changes. `compatibility-invalid_data_drops_key` is always reported; the others appear in `INFO SEARCH` only after the code path is first
-reached.
+changes. `compatibility-invalid_data_drops_key` and `compatibility-numeric_strict_parse` are always reported; the others appear in
+`INFO SEARCH` only after the code path is first reached.

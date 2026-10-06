@@ -108,6 +108,7 @@ class TestAppMetrics(ValkeySearchTestCaseDebugMode):
             # while search.emulate-release is below the fix version. See
             # COMPATIBILITY.md.
             "compatibility-invalid_data_drops_key",
+            "compatibility-numeric_strict_parse",
             "coordinator_bytes_in",
             "coordinator_bytes_out",
             "coordinator_client_get_global_metadata_failure_count",

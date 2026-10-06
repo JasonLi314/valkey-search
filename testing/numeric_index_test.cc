@@ -10,12 +10,14 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "src/indexes/index_base.h"
 #include "src/indexes/numeric.h"
 #include "src/query/predicate.h"
+#include "src/valkey_search_options.h"
 #include "testing/common.h"
 #include "vmsdk/src/testing_infra/utils.h"
 
@@ -105,6 +107,60 @@ TEST_F(NumericIndexTest, DetectsInvalidData) {
   EXPECT_EQ(index.ModifyRecordResult("key4", "still_not_a_number").value(),
             RecordResult::kInvalidData);
   EXPECT_FALSE(index.IsTracked("key4"));
+}
+
+// Spellings Redisearch rejects are invalid data from 1.3.0 and plain values
+// below it.
+TEST_F(NumericIndexTest, StrictParseGate) {
+  const std::string kZeros(341, '0');
+  std::vector<std::string> rejected = {
+      "-nan",   "+nan",     "nan(2)",   "1e309",     "-1e309", "0.1e310",
+      "1e-343", "1.0e-342", "10e-343",  "1e-400",    " 42",    "42 ",
+      "\t42",   "42\n",     "0x1p1024", "0x.8p-1074"};
+  rejected.push_back("1" + kZeros.substr(0, 309));
+  rejected.push_back(std::string(309, '9'));
+  rejected.push_back("0." + kZeros + "01");
+  std::vector<std::string> accepted = {
+      "inf",   "-inf",    "+inf",      "INF",      "infinity",  "1.8e308",
+      "9e308", "0.9e309", "0.001e311", "1e-342",   "0.1e-341",  "2e-324",
+      "-0",    "0e-1000", "0x10",      "0x1p1023", "0x0p-2000", "+5"};
+  accepted.push_back("1" + kZeros.substr(0, 18) + "e291");
+  accepted.push_back("0." + kZeros + "9");
+  accepted.push_back("1" + kZeros.substr(0, 308));
+  accepted.push_back("1" + kZeros.substr(0, 100) + "e-400");
+
+  const auto saved = options::GetEmulateRelease().GetValue();
+  VMSDK_EXPECT_OK(
+      options::GetEmulateRelease().SetValue(vmsdk::ValkeyVersion(1, 0, 0)));
+  int n = 0;
+  for (const auto &value : rejected) {
+    EXPECT_EQ(index.AddRecordResult(absl::StrCat("legacy", n++), value).value(),
+              RecordResult::kAdded)
+        << value;
+  }
+
+  VMSDK_EXPECT_OK(
+      options::GetEmulateRelease().SetValue(vmsdk::ValkeyVersion(1, 3, 0)));
+  for (const auto &value : rejected) {
+    const std::string key = absl::StrCat("rejected", n++);
+    EXPECT_EQ(index.AddRecordResult(key, value).value(),
+              RecordResult::kInvalidData)
+        << value;
+    EXPECT_FALSE(index.IsTracked(key)) << value;
+  }
+  for (const auto &value : accepted) {
+    const std::string key = absl::StrCat("accepted", n++);
+    EXPECT_EQ(index.AddRecordResult(key, value).value(), RecordResult::kAdded)
+        << value;
+    EXPECT_TRUE(index.IsTracked(key)) << value;
+  }
+  EXPECT_EQ(index.AddRecordResult("modified", "5").value(),
+            RecordResult::kAdded);
+  EXPECT_EQ(index.ModifyRecordResult("modified", "-nan").value(),
+            RecordResult::kInvalidData);
+  EXPECT_FALSE(index.IsTracked("modified"));
+
+  VMSDK_EXPECT_OK(options::GetEmulateRelease().SetValue(saved));
 }
 
 TEST_F(NumericIndexTest, SimpleAddModifyRemove1) {

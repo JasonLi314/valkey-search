@@ -1174,6 +1174,48 @@ class TestReturnClauseGate(ValkeySearchTestCaseDebugMode):
             assert result == id_only, f"emulate-release {release}"
 
 
+class TestNumericStrictParseGate(ValkeySearchTestCaseDebugMode):
+    """
+        A NUMERIC value Redisearch refuses (NaN, overflow, underflow,
+        surrounding whitespace; issue #1441) drops the whole key from 1.3.0
+        and is indexed below it. debug-mode is required to set
+        emulate-release at the module version.
+    """
+
+    def test_numeric_strict_parse_gate(self):
+        client: Valkey = self.server.get_new_client()
+        assert client.execute_command(
+            "FT.CREATE", "nsp_idx", "ON", "HASH", "PREFIX", "1", "nsp:",
+            "SCHEMA", "p", "NUMERIC", "m", "TAG") == b"OK"
+        IndexingTestHelper.wait_for_backfill_complete_on_node(client, "nsp_idx")
+
+        rejected = ["-nan", "1e309", "1e-343", " 42"]
+        accepted = ["inf", "1.8e308", "1e-342", "5"]
+        counter = "search_compatibility-numeric_strict_parse"
+        for release, tag, members, counted in (
+            ("1.2.1", "legacy", 8, len(rejected)),
+            ("1.3.0", "fixed", len(accepted), 0),
+        ):
+            assert client.execute_command(
+                "CONFIG", "SET", "search.emulate-release", release) == b"OK"
+            before = int(client.info("SEARCH")[counter])
+            for i, value in enumerate(rejected + accepted):
+                assert client.execute_command(
+                    "HSET", f"nsp:{tag}:{i}", "p", value, "m", tag) == 2
+            result = client.execute_command(
+                "FT.SEARCH", "nsp_idx", f"@m:{{{tag}}}", "NOCONTENT",
+                "LIMIT", "0", "100", "DIALECT", "2")
+            assert result[0] == members, f"emulate-release {release}: {result}"
+            assert int(client.info("SEARCH")[counter]) - before == counted, (
+                f"emulate-release {release}")
+
+        # A rewrite to a rejected value drops the key too.
+        assert client.execute_command("HSET", "nsp:fixed:7", "p", "-nan") == 0
+        result = client.execute_command(
+            "FT.SEARCH", "nsp_idx", "@m:{fixed}", "NOCONTENT", "DIALECT", "2")
+        assert result[0] == len(accepted) - 1, result
+
+
 class TestAggregateReducerAlias(ValkeySearchTestCaseDebugMode):
     """
         A REDUCE with no AS clause auto-generates its output name, and which form

@@ -7,7 +7,9 @@
 
 #include "src/indexes/numeric.h"
 
+#include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -15,6 +17,8 @@
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -23,18 +27,116 @@
 #include "src/query/predicate.h"
 #include "src/utils/string_interning.h"
 #include "src/valkey_search_options.h"
+#include "vmsdk/src/info.h"
 #include "vmsdk/src/type_conversions.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
 
 namespace valkey_search::indexes {
 namespace {
+
+vmsdk::info_field::Integer numeric_strict_parse_compat_counter(
+    "compatibility", "compatibility-numeric_strict_parse",
+    vmsdk::info_field::IntegerBuilder().App());
+
+constexpr uint64_t kAbsMask = 0x7fffffffffffffffULL;
+constexpr uint64_t kInfBits = 0x7ff0000000000000ULL;
+
+// Significant digits (leading zeros dropped) and the decimal exponent of the
+// last one, for a decimal spelling.
+struct DecimalShape {
+  int64_t significant = 0;
+  int64_t exponent = 0;
+};
+
+DecimalShape ScanDecimal(absl::string_view s) {
+  DecimalShape shape;
+  int64_t fraction = 0;
+  bool in_fraction = false;
+  size_t i = 0;
+  for (; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '.') {
+      in_fraction = true;
+      continue;
+    }
+    if (!absl::ascii_isdigit(c)) {
+      break;
+    }
+    if (in_fraction) {
+      ++fraction;
+    }
+    if (shape.significant > 0 || c != '0') {
+      ++shape.significant;
+    }
+  }
+  int64_t exponent = 0;
+  if (++i < s.size()) {
+    const bool negative = s[i] == '-';
+    i += negative || s[i] == '+';
+    for (; i < s.size() && exponent < 1'000'000; ++i) {
+      exponent = exponent * 10 + (s[i] - '0');
+    }
+    exponent = negative ? -exponent : exponent;
+  }
+  shape.exponent = exponent - fraction;
+  return shape;
+}
+
+// Mirrors which spellings Redisearch refuses to index: NaN, surrounding
+// whitespace, and values its parser cannot place.
+bool StrictParseRejects(absl::string_view data, double value) {
+  if (absl::ascii_isspace(data.front()) || absl::ascii_isspace(data.back())) {
+    return true;
+  }
+  const uint64_t abs_bits = std::bit_cast<uint64_t>(value) & kAbsMask;
+  if (abs_bits > kInfBits) {
+    return true;
+  }
+  const bool infinite = abs_bits == kInfBits;
+  const bool zero = abs_bits == 0;
+  absl::string_view digits = data;
+  if (digits.front() == '+' || digits.front() == '-') {
+    digits.remove_prefix(1);
+  }
+  if (absl::StartsWithIgnoreCase(digits, "0x")) {
+    bool nonzero = false;
+    for (char c : digits.substr(2)) {
+      if (c == 'p' || c == 'P') {
+        break;
+      }
+      nonzero |= c != '0' && c != '.';
+    }
+    return infinite || (zero && nonzero);
+  }
+  if (!absl::ascii_isdigit(digits.front()) && digits.front() != '.') {
+    return false;
+  }
+  const DecimalShape shape = ScanDecimal(digits);
+  if (shape.significant == 0) {
+    return false;
+  }
+  if (shape.significant > 19) {
+    return infinite || zero;
+  }
+  return shape.exponent > 308 || shape.exponent < -342;
+}
+
 std::optional<double> ParseNumber(absl::string_view data) {
   double value;
   if (absl::AsciiStrToLower(data) == "nan" || !absl::SimpleAtod(data, &value)) {
     return std::nullopt;
   }
+  if (StrictParseRejects(data, value)) {
+    // Writer thread: VALKEY_SEARCH_COMPATIBILITY_FIX would construct its
+    // counter here, which is main-thread only.
+    if (options::EnabledInVersion(1, 3, 0)) {
+      return std::nullopt;
+    }
+    numeric_strict_parse_compat_counter.Increment();
+  }
   return value;
 }
+
 }  // namespace
 
 Numeric::Numeric(const data_model::NumericIndex &numeric_index_proto)
